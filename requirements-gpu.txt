@@ -1,0 +1,18 @@
+# GPU runtime (Lightning AI / Colab). Install AFTER requirements-base.txt.
+#
+# Unsloth pins its own torch build. On Colab this conflicts with the preinstalled
+# torch and requires a runtime restart — do this once, in a single cell, early.
+# On Lightning AI Studio the base image is usually compatible as-is.
+#
+#   pip install -r requirements-base.txt
+#   pip install -r requirements-gpu.txt
+#   # then restart the runtime on Colab
+-r requirements-base.txt
+unsloth
+unsloth_zoo
+transformers>=4.57.0
+trl
+peft
+accelerate
+bitsandbytes
+qwen-vl-utils

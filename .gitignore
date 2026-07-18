@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Corpus images, model outputs, rendered demo pages — all regenerable.
+# Leading slash anchors these to the repo root: unanchored `data/` also matches
+# `src/data/`, which silently drops the loader and difficulty scorer.
+/data/
+/outputs/
+*.safetensors
+
+# Real customer invoices must never reach a remote. Belt and braces: the spike
+# uses only public FinTabNet, but this repo will later touch real data.
+**/invoices/
+**/real/
