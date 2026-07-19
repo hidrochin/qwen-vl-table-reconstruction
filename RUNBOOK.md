@@ -400,3 +400,113 @@ The production phase is a different problem and should not start by fine-tuning.
 With ~20 unlabeled invoices and no eval set there is no way to tell whether a
 fine-tune helped — the bottleneck is data, not the model. See the memory note
 `invoice-extraction-production-context` for the order that follows.
+
+---
+
+## 8. Phase two — production pipeline (on-prem, confidential data)
+
+Different machines, different data, different constraint. The spike (§§1–5) ran on
+public FinTabNet on Lightning/Colab. This runs on **company hardware only** —
+invoices are confidential and **must not leave the network**. No Colab, no
+third-party cloud. Both notebooks below call `localhost` and nothing else.
+
+Two notebooks form a **distillation loop**: the served 35B MoE drafts HTML labels
+for the unlabeled invoices, and those `(image, html)` pairs fine-tune the 8B
+student that gets served.
+
+| Runs on the L40 (serving) | Runs on the RTX 5000 (training) |
+|---|---|
+| 35B teacher labelling (`teacher-label-tables.ipynb`) | LoRA fine-tune (`finetune-and-serve.ipynb`) |
+| vLLM serve base + adapter | — |
+| live base-vs-adapter A/B | — |
+
+> **This proves the loop runs; it does not prove the fine-tune helps.** ~20 real
+> invoices is not trainable volume, and with no human-corrected eval set there is
+> nothing to score against. The visible A/B win will be mostly output-format
+> alignment. That is the honest read — do not oversell it.
+
+### 8.1 Label the invoices with the 35B teacher (`teacher-label-tables.ipynb`)
+
+Put the invoice images in `data/invoices/`. Confirm the teacher is up:
+
+```bash
+curl -s http://localhost:8000/v1/models | python -m json.tool   # expect qwen3.6-35b-a3b-fp8
+```
+
+In the notebook, set `BASE_URL` / `MODEL_NAME` to match `--served-model-name`,
+then **run the smoke-test cell first** — one image, before the batch. What to
+check in its output, not skim:
+
+1. A `<reasoning>` block that names what it is *excluding* (handwriting, QR, the
+   QR's reference string). If the reasoning does not mention the distractors, the
+   ignore-list is not landing — tighten `IGNORE_LIST`.
+2. `starts_with_table` is `True`. If not, inspect `out['raw']`; the model wrapped
+   or trailed the HTML and `clean_prediction` found no `<table>`.
+
+Then run the batch. It is **idempotent** — re-running skips images already in
+`data/teacher/labels.jsonl`, so a server hiccup costs nothing already earned.
+Watch for `no table parsed -- skipped`; those land in `*.raw.txt` for manual
+inspection.
+
+**The human-review cell is the only quality gate you have.** These labels train
+the student, so a hallucinated cell here becomes a learned error there. Skim every
+one. Correct the bad ones before §8.2 — a 35B still miscounts merged cells on a
+hard invoice.
+
+### 8.2 Fine-tune the 8B student (`finetune-and-serve.ipynb`)
+
+Runs on the RTX 5000, **not** the serving box. First, two confirmations that
+decide whether the run even fits:
+
+1. **Base identity.** `STUDENT_MODEL` must be the *exact* checkpoint vLLM serves
+   (`Qwen/Qwen3-VL-8B-Instruct`). A LoRA adapter only loads on the base it was
+   trained against. Wrong base → the adapter will not load in §8.3.
+2. **Which RTX 5000.** `gpu_report()` — `bf16=True` and ~32 GB means RTX 5000 Ada
+   and the 8B trains comfortably in 4-bit. `bf16=False` / 16 GB means Quadro RTX
+   5000 Turing: tighten `max_pixels`/`max_seq_length` or drop to a 4B base.
+
+The two lines that adapt the spike's trainer to production are already set in the
+config cell: `mode='full'` (invoices need cell text, not structure-only) and
+`instruction=STUDENT_INSTRUCTION`. **That instruction is concise and has no
+chain-of-thought** — the teacher reasoned offline; the student must emit HTML
+directly. The same string is used for training and for every serving call in
+§8.3. Do not diverge them (see §6, "Prompt edits change nothing").
+
+Same first-GPU-run caveat as §1.2: `lora.py` has never touched a real GPU on this
+codepath. Budget 30–60 min for signature mismatches. Healthy loss looks the same
+as §3.2 — fast drop for ~30 steps (format alignment), then a slower decline.
+
+Adapter lands in `outputs/invoice-lora/adapter/`. The verify cell checks
+`adapter_config.json` `base_model_name_or_path` matches the served base and that
+weights actually saved.
+
+### 8.3 Serve base + adapter with vLLM, and A/B
+
+In a terminal on the serving box (blocks; **new port** so it does not collide with
+the 35B on 8000):
+
+```bash
+vllm serve Qwen/Qwen3-VL-8B-Instruct \
+  --served-model-name qwen3vl-8b \
+  --enable-lora \
+  --lora-modules invoice-lora=/abs/path/to/outputs/invoice-lora/adapter \
+  --max-lora-rank 16 --max-model-len 8192 \
+  --limit-mm-per-prompt image=1 --port 8001
+```
+
+`--max-lora-rank` ≥ the training `lora_rank` (16). `--enable-lora` keeps base
+weights shared and lets you A/B base-vs-adapter live — the last two cells query
+`qwen3vl-8b` and `invoice-lora` on the same image with the same prompt.
+
+> **If vLLM rejects the vision-model LoRA** (multimodal-LoRA support is
+> model-specific and moves fast — check it in 5 minutes, do not assume): merge the
+> adapter (`model.save_pretrained_merged`) and serve the merged weights plainly.
+> You lose live A/B but keep the fine-tune.
+
+### 8.4 Where this sits
+
+This is steps (1)–(2) of the production order in
+`invoice-extraction-production-context`: the loop is wired end-to-end. It still
+needs a human-corrected eval set (the 20 invoices) and trainable volume (synthetic
+invoices) before a fine-tune number means anything. **Data is the bottleneck, not
+the model.**
