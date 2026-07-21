@@ -101,12 +101,18 @@ class TableReconstructor:
         mode: str = "structure",
         max_new_tokens: int = 2048,
         instruction: str | None = None,
+        ocr_layout: str | None = None,
     ) -> Prediction:
         """Generate HTML for one table image.
 
         ``instruction`` overrides the mode's default prompt. Pass a string from
         the notebook to iterate on prompts -- editing ``prompts.py`` mid-session
         has no effect, because the module is already imported.
+
+        ``ocr_layout`` (Option A) is the serialized OCR text+positions from
+        ``src.ocr.layout.serialize_layout``. Provide it with the grounded
+        instruction (``GROUNDED_INSTRUCTION``) so the model structures known
+        text instead of reading pixels.
         """
         import torch
         from PIL import Image
@@ -115,7 +121,7 @@ class TableReconstructor:
             raise ValueError(f"mode must be one of {sorted(INSTRUCTIONS)}")
 
         image = Image.open(image_path).convert("RGB")
-        messages = build_messages(image, mode, instruction)
+        messages = build_messages(image, mode, instruction, ocr_layout)
 
         text = self._processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -136,13 +142,26 @@ class TableReconstructor:
         return Prediction(uid=Path(image_path).stem, raw=raw, html=clean_prediction(raw))
 
     def predict_many(
-        self, image_paths: list[str | Path], mode: str = "structure", **kwargs
+        self,
+        image_paths: list[str | Path],
+        mode: str = "structure",
+        ocr_layouts: list[str] | None = None,
+        **kwargs,
     ) -> list[Prediction]:
         """Sequential generation with progress. Batching VLMs across differing
-        image sizes is fiddly and the eval set is small; clarity wins here."""
+        image sizes is fiddly and the eval set is small; clarity wins here.
+
+        ``ocr_layouts`` (Option A) is a per-image list aligned to
+        ``image_paths`` -- each layout goes only to its own image, unlike the
+        shared ``**kwargs``."""
+        if ocr_layouts is not None and len(ocr_layouts) != len(image_paths):
+            raise ValueError(
+                f"ocr_layouts has {len(ocr_layouts)} entries, expected {len(image_paths)}"
+            )
         preds = []
         for i, path in enumerate(image_paths, 1):
-            preds.append(self.predict(path, mode=mode, **kwargs))
+            per_image = {"ocr_layout": ocr_layouts[i - 1]} if ocr_layouts is not None else {}
+            preds.append(self.predict(path, mode=mode, **per_image, **kwargs))
             if i % 10 == 0 or i == len(image_paths):
                 print(f"  predicted {i}/{len(image_paths)}")
         return preds
