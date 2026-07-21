@@ -30,7 +30,34 @@ FULL_INSTRUCTION = (
     "markdown fences, no explanation."
 )
 
+# Option A: the model is handed the OCR text + positions, so it does *not*
+# re-read pixels for text -- it only decides structure. Pass this via
+# ``instruction=`` together with an ``ocr_layout=`` on predict.
+GROUNDED_INSTRUCTION = (
+    "You are given the document image and, below it, the OCR text with each "
+    "snippet's position. Reconstruct the printed data table as HTML. Take each "
+    "cell's text from the OCR -- do not re-transcribe from the image -- and use "
+    "the image and the positions to decide the structure: which cells merge "
+    "(rowspan/colspan), the header hierarchy (use <th> for headers), and the "
+    "reading order. Ignore anything that is not part of the printed table. "
+    "Output raw HTML starting with <table> and ending with </table>. No markdown "
+    "fences, no explanation."
+)
+
 INSTRUCTIONS = {"structure": STRUCTURE_INSTRUCTION, "full": FULL_INSTRUCTION}
+
+
+def format_layout_block(ocr_layout: str) -> str:
+    """Wrap the OCR layout in a delimited block for the user turn.
+
+    Delimiters keep the grounding text from bleeding into the instruction and
+    give the model a clear region to treat as source-of-truth for cell text.
+    """
+    return (
+        "OCR text and layout extracted from the image -- use it as the source of "
+        "cell text and positions; do not re-read the pixels for text:\n"
+        f"<ocr_layout>\n{ocr_layout}\n</ocr_layout>"
+    )
 
 
 def resolve_instruction(mode: str = "structure", instruction: str | None = None) -> str:
@@ -48,27 +75,49 @@ def resolve_instruction(mode: str = "structure", instruction: str | None = None)
     return INSTRUCTIONS[mode]
 
 
-def build_messages(image, mode: str = "structure", instruction: str | None = None) -> list[dict]:
+def build_messages(
+    image,
+    mode: str = "structure",
+    instruction: str | None = None,
+    ocr_layout: str | None = None,
+) -> list[dict]:
     """Build a Qwen-VL chat message list for one table image.
 
     ``image`` may be a PIL image or a path; qwen-vl-utils accepts both.
+
+    ``ocr_layout`` (Option A) is appended to the same text block rather than
+    added as a second content item -- a single text turn is what every VL
+    processor accepts, and it keeps the ``[image, text]`` shape stable. Omit it
+    and the message is byte-for-byte the ungrounded one.
     """
+    text = resolve_instruction(mode, instruction)
+    if ocr_layout:
+        text = f"{text}\n\n{format_layout_block(ocr_layout)}"
     return [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": resolve_instruction(mode, instruction)},
+                {"type": "text", "text": text},
             ],
         }
     ]
 
 
 def build_training_example(
-    image, target_html: str, mode: str = "structure", instruction: str | None = None
+    image,
+    target_html: str,
+    mode: str = "structure",
+    instruction: str | None = None,
+    ocr_layout: str | None = None,
 ) -> dict:
-    """Build a supervised example: prompt messages plus the assistant turn."""
-    messages = build_messages(image, mode, instruction)
+    """Build a supervised example: prompt messages plus the assistant turn.
+
+    ``ocr_layout`` must be included here too when training the grounded model,
+    or the adapter learns from a prompt it will never see at inference -- the
+    same train/inference prompt-match rule the LoRA config guards.
+    """
+    messages = build_messages(image, mode, instruction, ocr_layout)
     messages.append({"role": "assistant", "content": [{"type": "text", "text": target_html}]})
     return {"messages": messages}
 
