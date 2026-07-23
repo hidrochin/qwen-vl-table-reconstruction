@@ -1,9 +1,40 @@
-# RUNBOOK — Qwen3-VL Table Reconstruction Spike
-
-Demo: **Wednesday 22 July 2026.** Build days: Sat 19 → Tue 21.
+# RUNBOOK — Qwen-VL Table Reconstruction
 
 This is the execution order. `CLAUDE.md` explains *why* the design is what it is;
 this file is *what to type, in what order, and what should come back*.
+
+---
+
+## Current: two-track execution order (all self-hosted, no API)
+
+The repo now runs on **two tracks that share `src/`**. There is **no hosted-API path** —
+`HF_TOKEN` is not needed anywhere. Sections 1–8 below are the original day-by-day spike
+log, kept for the corpus/eval mechanics; where they say "API bake-off" or `HF_TOKEN`, read
+the local-GPU commands here instead.
+
+**Track 1 — Lightning AI free GPU, PUBLIC data (FinTabNet + hand-drawn sample):**
+
+```bash
+pip install -r requirements-base.txt && pip install -r requirements-gpu.txt
+# build the hardest-table corpus (CPU/network), then bake off local models:
+python notebook/bakeoff.py --corpus data/corpus --limit 40 --mode structure
+python notebook/bakeoff.py --corpus data/corpus --mode schema --grounded   # two-stage
+# train a small student, then score it vs its baseline (honours the significance gate):
+python notebook/train.py --corpus data/corpus --model qwen3-vl-4b --mode structure
+python notebook/eval.py  --corpus data/corpus --model qwen3-vl-4b \
+    --adapter outputs/lora/adapter --baseline outputs/runs/qwen3-vl-4b.json
+```
+
+**Track 2 — company server, PRIVATE data (the 20 confidential invoices, on-prem):**
+
+```bash
+pip install -r requirements-base.txt && pip install -r requirements-onprem.txt
+vllm serve Qwen/Qwen3.6-27B --port 8000 --quantization fp8   # the teacher
+```
+then, in order: `teacher-label-tables.ipynb` (27B drafts labels) → human-correct →
+`finetune-and-serve.ipynb` (distil the 8B student, serve with `--enable-lora`, A/B) →
+`two-stage-reconstruct.ipynb` (the schema-inference pipeline on one invoice). Nothing
+leaves the network.
 
 ---
 
@@ -410,14 +441,16 @@ public FinTabNet on Lightning/Colab. This runs on **company hardware only** —
 invoices are confidential and **must not leave the network**. No Colab, no
 third-party cloud. Both notebooks below call `localhost` and nothing else.
 
-Two notebooks form a **distillation loop**: the served 35B MoE drafts HTML labels
-for the unlabeled invoices, and those `(image, html)` pairs fine-tune the 8B
-student that gets served.
+Three notebooks form the **two-stage distillation loop**: the served **Qwen3.6-27B
+dense teacher** (vision + thinking — stronger on schema *reasoning* than the 35B-A3B MoE)
+drafts logical-HTML labels for the unlabeled invoices via the two-stage path, and those
+`(image, html)` pairs distil the 8B student that gets served. `two-stage-reconstruct.ipynb`
+is the standalone pipeline demo. (`Qwen/Qwen3.6-35B-A3B` remains a config swap-in.)
 
 | Runs on the L40 (serving) | Runs on the RTX 5000 (training) |
 |---|---|
-| 35B teacher labelling (`teacher-label-tables.ipynb`) | LoRA fine-tune (`finetune-and-serve.ipynb`) |
-| vLLM serve base + adapter | — |
+| 27B teacher labelling (`teacher-label-tables.ipynb`) | LoRA distillation (`finetune-and-serve.ipynb`) |
+| vLLM serve base + adapter (`--enable-lora`) | — |
 | live base-vs-adapter A/B | — |
 
 > **This proves the loop runs; it does not prove the fine-tune helps.** ~20 real
@@ -425,12 +458,12 @@ student that gets served.
 > nothing to score against. The visible A/B win will be mostly output-format
 > alignment. That is the honest read — do not oversell it.
 
-### 8.1 Label the invoices with the 35B teacher (`teacher-label-tables.ipynb`)
+### 8.1 Label the invoices with the 27B teacher (`teacher-label-tables.ipynb`)
 
 Put the invoice images in `data/invoices/`. Confirm the teacher is up:
 
 ```bash
-curl -s http://localhost:8000/v1/models | python -m json.tool   # expect qwen3.6-35b-a3b-fp8
+curl -s http://localhost:8000/v1/models | python -m json.tool   # expect Qwen/Qwen3.6-27B
 ```
 
 In the notebook, set `BASE_URL` / `MODEL_NAME` to match `--served-model-name`,
@@ -483,7 +516,7 @@ weights actually saved.
 ### 8.3 Serve base + adapter with vLLM, and A/B
 
 In a terminal on the serving box (blocks; **new port** so it does not collide with
-the 35B on 8000):
+the 27B teacher on 8000):
 
 ```bash
 vllm serve Qwen/Qwen3-VL-8B-Instruct \

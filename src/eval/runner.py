@@ -15,7 +15,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from src.data.loader import TableRecord
-from src.eval.metrics import bootstrap_ci, intervals_overlap, span_recovery
+from src.eval.metrics import (
+    blank_preservation,
+    bootstrap_ci,
+    content_placement,
+    intervals_overlap,
+    schema_match,
+    span_recovery,
+)
 from src.eval.teds import teds_score
 
 
@@ -31,6 +38,12 @@ class Result:
     true_html: str
     image_path: str
     parse_failed: bool = False
+    # Logical-reconstruction metrics (meaningful for schema/full modes; ~0 for a
+    # structure-only run, which emits no cell text). Defaults keep load_run of
+    # older run JSON working.
+    content_placement: float = 0.0
+    blank_preservation: float = 1.0
+    schema_cols_correct: bool = False
 
 
 @dataclass
@@ -43,6 +56,9 @@ class RunSummary:
     mean_span_recall: float
     parse_failures: int
     by_bin: dict = field(default_factory=dict)
+    mean_content_placement: float = 0.0
+    mean_blank_preservation: float = 1.0
+    schema_col_accuracy: float = 0.0
 
 
 def evaluate_predictions(
@@ -55,6 +71,9 @@ def evaluate_predictions(
     for rec in records:
         pred = predictions.get(rec.uid, "")
         recovery = span_recovery(pred, rec.html)
+        placement = content_placement(pred, rec.html)
+        blanks = blank_preservation(pred, rec.html)
+        schema = schema_match(pred, rec.html)
         results.append(
             Result(
                 uid=rec.uid,
@@ -67,6 +86,9 @@ def evaluate_predictions(
                 true_html=rec.html,
                 image_path=rec.image_path,
                 parse_failed=not pred.strip(),
+                content_placement=placement.accuracy,
+                blank_preservation=blanks.rate,
+                schema_cols_correct=schema.cols_correct,
             )
         )
     return results, summarize_run(results, run_name)
@@ -78,6 +100,7 @@ def summarize_run(results: list[Result], name: str) -> RunSummary:
 
     scores = [r.teds_struct for r in results]
     mean, low, high = bootstrap_ci(scores)
+    n = len(results)
 
     by_bin = {}
     for label in ("easy", "medium", "hard"):
@@ -88,13 +111,16 @@ def summarize_run(results: list[Result], name: str) -> RunSummary:
 
     return RunSummary(
         name=name,
-        n=len(results),
+        n=n,
         mean_teds=mean,
         ci_low=low,
         ci_high=high,
-        mean_span_recall=sum(r.span_recall for r in results) / len(results),
+        mean_span_recall=sum(r.span_recall for r in results) / n,
         parse_failures=sum(r.parse_failed for r in results),
         by_bin=by_bin,
+        mean_content_placement=sum(r.content_placement for r in results) / n,
+        mean_blank_preservation=sum(r.blank_preservation for r in results) / n,
+        schema_col_accuracy=sum(r.schema_cols_correct for r in results) / n,
     )
 
 
@@ -126,6 +152,20 @@ def compare_runs(baseline: RunSummary, candidate: RunSummary) -> str:
     else:
         direction = "improves over" if delta > 0 else "regresses against"
         lines.append(f"\n  {candidate.name} {direction} {baseline.name} (intervals disjoint).")
+
+    # Schema-inference metrics (informative for schema/full runs; ~0 content
+    # placement for structure-only runs, where the prediction has no cell text).
+    lines.append(
+        f"\n{'schema metric':<22} {'baseline':>10} {'candidate':>10}\n" + "-" * 44
+    )
+    for label, attr in (
+        ("content placement", "mean_content_placement"),
+        ("blank preservation", "mean_blank_preservation"),
+        ("schema col accuracy", "schema_col_accuracy"),
+    ):
+        lines.append(
+            f"{label:<22} {getattr(baseline, attr):>10.4f} {getattr(candidate, attr):>10.4f}"
+        )
 
     if baseline.by_bin and candidate.by_bin:
         lines.append(f"\n{'bin':<10} {'n':>4} {'baseline':>10} {'candidate':>10} {'delta':>9}")

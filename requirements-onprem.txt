@@ -1,0 +1,15 @@
+# On-prem company server (Track 2, PRIVATE invoices). Install AFTER requirements-base.txt.
+#
+# This box serves the Qwen3.6-27B teacher and the 8B student locally with vLLM,
+# distils the student on the RTX 5000, and runs the document specialists for
+# stage-1 OCR + on-prem auto-labelling. Nothing here calls a hosted API -- the
+# 20 confidential invoices never leave the network.
+#
+#   pip install -r requirements-base.txt
+#   pip install -r requirements-onprem.txt
+-r requirements-gpu.txt        # training stack (unsloth/trl/peft) + vllm + openai client
+
+# Document specialists -- stage-1 OCR+geometry and the table-structure ceiling.
+mineru                         # MinerU2.5-Pro (best open Table-TEDS; opendatalab)
+paddleocr                      # PaddleOCR-VL + OCR words used for grounding
+paddlepaddle                   # paddleocr backend (swap for paddlepaddle-gpu on the box)

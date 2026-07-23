@@ -16,3 +16,5 @@ peft
 accelerate
 bitsandbytes
 qwen-vl-utils
+vllm            # local-GPU inference backend + offline batch labelling (no hosted API)
+openai          # client for a locally served vLLM endpoint (loopback only)
