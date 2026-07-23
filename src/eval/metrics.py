@@ -63,6 +63,115 @@ def span_recovery(pred_html: str, true_html: str) -> SpanRecovery:
     )
 
 
+# --- Logical-reconstruction metrics (the schema-inference task) -----------------
+#
+# TEDS-Struct and span recovery measure *structure*. The invoice tables in
+# ``layout_description.md`` also demand that every printed fragment lands in the
+# right logical cell and that blank cells stay blank -- neither of which
+# structure-only scoring can see. These three metrics are position-aware (keyed by
+# the occupancy-grid anchor from ``extract_cells``) and are meaningful only for
+# text-emitting predictions (mode ``schema`` / ``full``); on a structure-only run
+# the prediction has no cell text, so content placement reads ~0 by design.
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _anchor_text_map(html: str) -> dict[tuple[int, int], str]:
+    """Map each cell's grid anchor (row, col) to its normalized text."""
+    return {(c.row, c.col): _norm(c.text) for c in extract_cells(html)}
+
+
+def _grid_dims(html: str) -> tuple[int, int]:
+    """(rows, cols) of the occupancy grid -- the logical schema's shape."""
+    cells = extract_cells(html)
+    if not cells:
+        return (0, 0)
+    rows = max(c.row + c.rowspan for c in cells)
+    cols = max(c.col + c.colspan for c in cells)
+    return (rows, cols)
+
+
+@dataclass
+class ContentPlacement:
+    matched: int
+    total: int
+
+    @property
+    def accuracy(self) -> float:
+        """Fraction of true text fragments placed in the correct logical cell.
+
+        1.0 when the ground truth has no text cells (nothing to place)."""
+        return self.matched / self.total if self.total else 1.0
+
+
+@dataclass
+class BlankPreservation:
+    preserved: int
+    total: int
+
+    @property
+    def rate(self) -> float:
+        """Fraction of truly-blank cells left blank -- catches value-shifting.
+
+        1.0 when the ground truth has no blank cells."""
+        return self.preserved / self.total if self.total else 1.0
+
+
+@dataclass
+class SchemaMatch:
+    true_cols: int
+    pred_cols: int
+    true_rows: int
+    pred_rows: int
+
+    @property
+    def cols_correct(self) -> bool:
+        """Right number of logical columns -- e.g. did it get the Optional column?"""
+        return self.true_cols == self.pred_cols
+
+    @property
+    def exact(self) -> bool:
+        return self.true_cols == self.pred_cols and self.true_rows == self.pred_rows
+
+
+def content_placement(pred_html: str, true_html: str) -> ContentPlacement:
+    """Position-aware fragment placement: right text in the right logical cell.
+
+    A value transcribed correctly but dropped in the wrong cell does not count --
+    that is exactly the failure (value-shifting across sparse columns) the invoice
+    task is most exposed to.
+    """
+    true_map = _anchor_text_map(true_html)
+    pred_map = _anchor_text_map(pred_html)
+    true_text = {pos: t for pos, t in true_map.items() if t}
+    matched = sum(1 for pos, t in true_text.items() if pred_map.get(pos, "") == t)
+    return ContentPlacement(matched=matched, total=len(true_text))
+
+
+def blank_preservation(pred_html: str, true_html: str) -> BlankPreservation:
+    """How many truly-blank cells stayed blank (no neighbouring value shifted in)."""
+    true_map = _anchor_text_map(true_html)
+    pred_map = _anchor_text_map(pred_html)
+    true_blanks = [pos for pos, t in true_map.items() if not t]
+    preserved = sum(1 for pos in true_blanks if pred_map.get(pos, "") == "")
+    return BlankPreservation(preserved=preserved, total=len(true_blanks))
+
+
+def schema_match(pred_html: str, true_html: str) -> SchemaMatch:
+    """Compare the inferred logical schema (grid shape) to ground truth.
+
+    ``cols_correct`` is the headline: getting the logical column count right means
+    the model resolved the variable/implicit columns (the Optional column).
+    """
+    true_rows, true_cols = _grid_dims(true_html)
+    pred_rows, pred_cols = _grid_dims(pred_html)
+    return SchemaMatch(
+        true_cols=true_cols, pred_cols=pred_cols, true_rows=true_rows, pred_rows=pred_rows
+    )
+
+
 def bootstrap_ci(
     values: list[float],
     n_resamples: int = 2000,

@@ -1,12 +1,16 @@
 """Prompt construction for Qwen3-VL table reconstruction.
 
-Two output modes:
+Three modes:
 
 * ``structure`` -- tags and span attributes only, no cell text. The training
   target and the TEDS-Struct input. Roughly 5-10x shorter, which is what makes
   training fit on a small GPU.
 * ``full`` -- HTML including cell text. Slower and mixes OCR into the output,
   but the rendered tables look real, so it is what the demo visuals use.
+* ``schema`` -- the logical-reconstruction path for the invoice tables in
+  ``layout_description.md``: hand the model the near-invariant header schema as a
+  prior and make it infer the variable body schema (implicit/optional columns)
+  and assign OCR fragments to logical cells. Pair with ``ocr_layout=`` (stage-1).
 
 Prompts are deliberately terse about format. Base VLMs like to wrap output in
 markdown fences and add commentary, both of which break parsing; saying so
@@ -44,7 +48,68 @@ GROUNDED_INSTRUCTION = (
     "fences, no explanation."
 )
 
-INSTRUCTIONS = {"structure": STRUCTURE_INSTRUCTION, "full": FULL_INSTRUCTION}
+# Schema-conditioned prompting (the two-stage / logical-reconstruction path).
+#
+# These tables (see ``layout_description.md``) are not conventional TSR: the
+# header is near-invariant across documents, but the *body* determines the
+# logical schema -- e.g. whether an "Optional" child column exists at all. The
+# structure cannot be read off the header alone, so we hand the model the known
+# header schema as a prior and make it infer the rest from body evidence. This is
+# the stage-2 instruction; pair it with ``ocr_layout=`` from stage-1.
+DEFAULT_INVOICE_SCHEMA = (
+    "Header (two levels, near-constant across documents):\n"
+    "  - Currency  -> child columns: Description, Value\n"
+    "  - Figure100 -> child columns: Number, Type, [Optional]\n"
+    "  - Figures   -> child columns: Debit, Credit\n"
+    "The 'Optional' child under Figure100 EXISTS ONLY WHEN the body supplies a\n"
+    "third value in that group (e.g. 'Nil'); otherwise Figure100 has just\n"
+    "Number and Type. The printed header never signals this -- infer it from the body.\n"
+    "Column semantics: Number is numeric; Type is a symbol (D/C); Value is like\n"
+    "'3%' or '1000'; Debit/Credit are amounts."
+)
+
+SCHEMA_INSTRUCTION_TEMPLATE = (
+    "Reconstruct the latent LOGICAL table as HTML -- recover the logical table, "
+    "not the visual appearance. You are given the image and, below it, the OCR "
+    "text with positions. Use this known header schema as a prior:\n"
+    "{schema}\n\n"
+    "Rules:\n"
+    "1. Infer the logical schema from the BODY, not just the header: decide how "
+    "many logical columns each record group actually has (e.g. is the Optional "
+    "column present?).\n"
+    "2. Assign every printed text fragment from the OCR to exactly one logical "
+    "cell. Do not re-transcribe from pixels; do not invent values.\n"
+    "3. Keep blank cells blank. A blank is real content -- never shift a "
+    "neighbouring value to fill an empty position, and never merge two logical "
+    "columns just because one is sparse.\n"
+    "4. Group/section rows (e.g. 'ABC', 'DEF') carry text only in the first "
+    "logical column; the rest of that row is empty. Summary rows (e.g. 'Total') "
+    "are ordinary rows with values in only some columns.\n"
+    "5. Use <th> for the two-level header and preserve parent/child relationships "
+    "with rowspan/colspan. Preserve merged cells in headers, section rows, and "
+    "summary rows.\n"
+    "Output raw HTML starting with <table> and ending with </table>. No markdown "
+    "fences, no explanation."
+)
+
+SCHEMA_INSTRUCTION = SCHEMA_INSTRUCTION_TEMPLATE.format(schema=DEFAULT_INVOICE_SCHEMA)
+
+INSTRUCTIONS = {
+    "structure": STRUCTURE_INSTRUCTION,
+    "full": FULL_INSTRUCTION,
+    "schema": SCHEMA_INSTRUCTION,
+}
+
+
+def build_schema_instruction(schema: str = DEFAULT_INVOICE_SCHEMA) -> str:
+    """Fill the schema-conditioned instruction with a domain's header schema.
+
+    Pass the result via ``instruction=`` to point the model at a different
+    document family's known header without editing this module. Editing the
+    module mid-session has no effect -- it is already imported (see
+    ``resolve_instruction``).
+    """
+    return SCHEMA_INSTRUCTION_TEMPLATE.format(schema=schema)
 
 
 def format_layout_block(ocr_layout: str) -> str:

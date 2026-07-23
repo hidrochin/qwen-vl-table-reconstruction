@@ -6,64 +6,124 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 0. Repository State
 
-**This is a 4-day feasibility spike, not a research project.** Customer demo is
-Wednesday 22 July 2026. The goal is to decide whether Qwen3-VL is worth committing
-company resources to for finance invoice table extraction — not to produce a novel
-finding. Sections 1–12 below are the original proposal, amended where the spike's
-constraints made them wrong.
+**This is a feasibility spike that became a phase-two distillation pipeline, not a
+research project.** The goal is to decide whether a **self-hosted** Qwen-VL is accurate
+enough on hard financial-invoice tables to commit company resources, and to stand up the
+pipeline that turns a strong on-prem teacher into a servable student. Sections 1–12 below
+are the original proposal, amended where the spike's constraints made them wrong.
 
-**`RUNBOOK.md` is the execution order** — what to run, on which machine, in what
-sequence, and what to do when a step fails. This file explains *why*; that one says
-*what to type*.
+**The real task is in `layout_description.md` — logical-schema *inference*, not
+conventional TSR.** The invoice tables have a near-invariant two-level header but a
+*variable body schema*: whether an "Optional" column exists is implied by the **body**,
+not the header; some columns are never printed; many cells are legitimately blank and must
+stay blank (no value-shifting). Recovering the latent logical table — right columns, right
+cells, blanks kept — is the problem; reproducing the appearance is not.
 
-Implementation lives in `src/`; `qwen-vl-table-reconstruction.ipynb` is a thin driver
-that imports from it. Notebooks-as-codebase is how this becomes unreproducible.
+**`RUNBOOK.md` is the execution order** — what to run, on which machine, in what sequence.
+This file explains *why*; that one says *what to type*.
+
+### Two tracks, one shared library — everything self-hosted, no hosted API
+
+There is **no hosted-API path anywhere in this repo** (Kimi-K2.5 and all frontier/API
+models were removed — not self-hostable, not private). `src/` is the shared library; the
+two tracks differ only in drivers, data, hardware, and model size:
+
+- **Track 1 — Python, Lightning AI free GPU, PUBLIC data** (FinTabNet + the hand-drawn
+  sample). Reproducible CLI drivers: `notebook/bakeoff.py`, `train.py`, `eval.py`.
+- **Track 2 — notebooks, company server, PRIVATE data** (the 20 confidential invoices):
+  `teacher-label-tables.ipynb`, `finetune-and-serve.ipynb`, `two-stage-reconstruct.ipynb`.
+  Nothing leaves the network.
 
 ```
-src/data/    html_utils, difficulty scoring, FinTabNet loader
-src/eval/    TEDS-Struct, span recovery, bootstrap CIs, run comparison
-src/model/   prompts, output cleaning, Qwen3-VL inference
-src/train/   Unsloth LoRA
+src/data/    html_utils, difficulty scoring, FinTabNet loader, image prep (images.py)
+src/ocr/     stage-1 OCR words (engine.py) + geometric row/col grounding (layout.py)
+src/eval/    TEDS-Struct, span recovery, schema-inference metrics, bootstrap CIs, compare
+src/model/   registry.py (single source of truth for model roles), prompts
+             (structure/full/schema), inference.py (transformers/unsloth/vLLM backends,
+             thinking toggle), vllm_client.py (local served-endpoint client + guided
+             decoding), paddle_client.py + mineru_client.py (specialists),
+             docparse_utils.py (shared specialist output-parsing)
+src/train/   Unsloth LoRA — structure / schema / OCR-grounded / teacher-distillation
 src/demo/    side-by-side comparison renderer
-tests/       56 tests — run these before trusting any number
+notebook/    Track-1 drivers (bakeoff/train/eval .py); Track-2 notebooks live at repo root
+tests/       run these before trusting any number
 ```
 
 ### Status: what has actually been run
 
-Verified end-to-end against live FinTabNet: corpus build (scan → rank → dedup →
-download → manifest → leakage check), TEDS-Struct, span recovery, bootstrap CIs, and
-the comparison renderer. All nine `src/` modules import without torch.
+Verified end-to-end against live FinTabNet: corpus build (scan → rank → dedup → download →
+manifest → leakage check), TEDS-Struct, span recovery, the new schema-inference metrics,
+bootstrap CIs, and the comparison renderer. **All 18 `src/` modules import on the Mac with
+no torch/vllm/paddle** — the deferred-import invariant holds.
 
-**Not verified: `src/model/inference.py` and `src/train/lora.py` have never been
-executed** — there is no GPU on the dev Mac. They are written against documented
-Unsloth/Transformers APIs, so treat the first GPU run as a debugging session and
-budget 30–60 minutes for it.
+**Not verified — treat the first run as a debugging session:**
+- `inference.py` (transformers/unsloth/**vLLM** backends), `train/lora.py` — never executed
+  (no GPU on the Mac).
+- `vllm_client.py` — stand up `vllm serve` first; the client is exercised only up to the
+  OpenAI-protocol boundary.
+- `paddle_client.py` / `mineru_client.py` — the exact result-object shapes are unconfirmed;
+  `docparse_utils.extract_table_html` is defensive. Budget a short debugging pass.
+  `mineru`/`paddleocr` live in `requirements-onprem.txt`, not `requirements-base`.
+
+### All-local model selection (supersedes the Qwen3-VL-4B/8B framing below)
+
+Every model is open-weights and self-hostable. `data` is the confidential-boundary gate:
+`MODELS` in `src/model/registry.py` enforces it, so a Track-1 cloud driver can only
+enumerate `public`/`both` models — never a `private` teacher.
+
+| Model (repo id) | Role | Track · hardware |
+|---|---|---|
+| **Qwen3.6-27B** dense `Qwen/Qwen3.6-27B` | **on-prem teacher** — vision + thinking; more potent than 35B-A3B for schema *reasoning* (27B active vs 3B), same family → clean distillation | private · L40 48 GB FP8 / vLLM |
+| `Qwen/Qwen3.6-35B-A3B` (MoE 35B/3B) | prior teacher, config swap-in | private · L40 |
+| `Qwen/Qwen3-VL-30B-A3B-Instruct` | public anchor / ceiling | public · Lightning 24 GB 4-bit |
+| **MinerU2.5-Pro** `opendatalab/MinerU2.5-Pro-2605-1.2B` | stage-1 OCR+geometry **+ best-open-Table-TEDS ceiling** (non-AGPL) | both · local 1.2 B |
+| **PaddleOCR-VL-1.6** `PaddlePaddle/PaddleOCR-VL-1.6` (0.9 B) | stage-1 OCR / overall-doc leader (96.33 OmniDocBench) | both · local |
+| `Qwen/Qwen3-VL-8B`/`4B-Instruct` | trainable **student** (distillation target) | both · Lightning / RTX 5000 |
+| `rednote-hilab/dots.ocr`, `zai-org/GLM-OCR` | specialist alternates | both · local |
+
+**Confidential-data boundary (non-negotiable):** the 20 invoices never leave the network.
+Their teacher, the specialists that draft their labels, and the student all run **on-prem
+(Track 2)**. Track 1 (Lightning cloud) is **public data only**. The registry's `data`
+field is the gate — keep it honest when adding models.
+
+### The two-stage approach (SOTA for schema inference)
+
+Matches `layout_description.md`'s own "infer schema → assign fragments → HTML" pipeline and
+reuses the OCR grounding already built:
+- **Stage 1 — OCR + geometry (local):** PaddleOCR / MinerU words → `serialize_layout()`
+  grid or coords block (`src/ocr/`).
+- **Stage 2 — schema-conditioned reasoning VLM (thinking on):** hand it the near-invariant
+  header schema as a prior (`prompts.build_schema_instruction`), make it infer the variable
+  body schema (Optional column?), assign every OCR fragment to a logical cell, and keep
+  blanks blank. Force valid HTML with vLLM guided decoding (`vllm_client` `guided_*`).
 
 ### Three constraints that are easy to break by accident
 
 - **Prompts are passed, not edited.** `predict`/`predict_many`/`TrainConfig` all take
-  `instruction=`. Editing `src/model/prompts.py` mid-session does nothing — the module
-  is already imported, so the old prompt is scored again and it reads as "prompt
-  engineering had no effect."
-- **The training prompt and the inference prompt must match.** `TrainConfig.instruction`
-  exists for this. A mismatch discards most of what the adapter learned.
-- **Both comparison arms must load the same way.** Unsloth's 4-bit path is not
-  bit-identical to plain bitsandbytes, so a baseline loaded one way against a fine-tune
-  loaded the other measures quantization as well as fine-tuning. `use_unsloth=True`
-  everywhere.
+  `instruction=`. Editing `src/model/prompts.py` mid-session does nothing — the module is
+  already imported, so the old prompt is scored again and it reads as "prompt engineering
+  had no effect." (Use `build_schema_instruction(schema)` to vary the header prior.)
+- **The training prompt and the inference prompt must match.** For the two-stage path this
+  means the *same* `mode="schema"` instruction **and** the same stage-1 `ocr_layouts=` in
+  `train()`. A mismatch discards most of what the adapter learned.
+- **Both comparison arms must load the same way.** Unsloth's 4-bit path is not bit-identical
+  to plain bitsandbytes, so a baseline and a fine-tune loaded differently measure
+  quantization as well as fine-tuning. Load both arms identically (`backend="unsloth"` on
+  both, or the shared `load_in_4bit` path in `eval.py`).
 
-One model in VRAM at a time. `TableReconstructor.close()` and `free_memory()` exist
-because the failure mode is an OOM *after* a training run, not before it.
+One model in VRAM at a time. `TableReconstructor.close()` / `free_memory()` exist because
+the failure mode is an OOM *after* a training run, not before it.
 
-Environment: Python 3.11 via `uv` (`.venv/`). `requirements-base.txt` is CPU-only and
-installs on the Mac; `requirements-gpu.txt` adds torch/Unsloth for the GPU box. **Every
-heavy import in `src/` is deferred into function bodies**, so all nine modules import
-without CUDA — data prep, evaluation, and rendering stay runnable locally while only
-generation and training need a GPU. Preserve that when adding code.
+Environment: Python 3.11 via `uv` (`.venv/`). `requirements-base.txt` is CPU-only (Mac);
+`requirements-gpu.txt` adds torch/Unsloth/**vLLM**/openai for Lightning (Track 1);
+`requirements-onprem.txt` adds the specialists (`mineru`, `paddleocr`) for the company box
+(Track 2). **Every heavy import in `src/` is deferred into function bodies** — torch, vllm,
+openai, huggingface_hub, PIL/pillow-heif, paddleocr, mineru — so every module imports on
+the Mac. Preserve that when adding code.
 
-Compute is **Lightning AI Studio**, not Colab: its persistent filesystem means a
-disconnect does not cost the corpus and checkpoints. Colab free-tier T4 is the fallback
-and requires checkpointing to Drive.
+Compute: **Lightning AI Studio** (Track 1, public) + the **company server** (Track 2,
+private: L40 serving, RTX 5000 training). Persistent filesystem means a disconnect does not
+cost the corpus/checkpoints.
 
 Two calibration facts, both measured, both easy to get wrong again:
 
@@ -123,9 +183,18 @@ a general VLM fine-tuned on PubTabNet, reports **97.6% S-TEDS**; specialized mod
 
 The question this spike actually answers is an engineering one:
 
-> Is Qwen3-VL accurate enough on hard financial tables — merged cells, nested headers,
-> mixed bordered/borderless — to justify committing company resources, and does LoRA
-> fine-tuning move it enough to be worth the pipeline?
+> Is a **self-hostable** Qwen-VL accurate enough on hard financial-invoice tables —
+> merged cells, nested headers, **and (the real target) an implicit, variable logical
+> schema** — to justify committing company resources, and does teacher-distillation move
+> a small student enough to be worth the pipeline?
+
+**The reframed task (`layout_description.md`) raises the bar past TSR.** Standard TSR
+assumes the schema is given and recovers cells. These invoices require *inferring the
+logical schema first*: the number of logical columns is not on the page (the "Optional"
+column exists only when the body implies it), some child headers are never printed, and
+blank cells are real content that must not be back-filled by shifting a neighbour. This is
+a **reasoning** problem, which is why the teacher is a dense thinking model and the
+approach is two-stage (ground with OCR geometry, then reason over the schema).
 
 Useful calibration for what to expect: Qwen2.5-VL-**32B** scores **81.7 TEDS zero-shot,
 83.7 fine-tuned**. Do not benchmark a 4B LoRA run against 97% and call it a failure.
@@ -139,6 +208,12 @@ about tables." Overselling that distinction costs credibility in month two.
 ---
 
 # 4. Proposed Method
+
+> **Amended:** the single-stage "image → HTML" method below is the public-data baseline.
+> The recommended method for the invoice tables is the **two-stage decoupled** pipeline in
+> §0 (stage-1 OCR+geometry grounding → stage-2 schema-conditioned reasoning VLM), because
+> the logical schema cannot be read off the pixels alone. The training path mirrors it:
+> `TrainConfig(mode="schema")` + `ocr_layouts=` + teacher `targets=` (distillation).
 
 ## Input
 
@@ -334,6 +409,23 @@ the default.
 **Secondary: span recovery rate** ("recovered 47 of 52 merged cells"). Position-aware —
 a correct span shape in the wrong cell does not count. Customers have intuition for this
 number and none for 0.91 TEDS-Struct.
+
+**Schema-inference metrics (for the logical-reconstruction task).** TEDS-Struct and span
+recovery measure *structure*; `layout_description.md` also demands the right text in the
+right cell and blanks kept blank. `src/eval/metrics.py` adds three position-aware metrics,
+threaded through `RunSummary` and `compare_runs`:
+
+- **content placement** — fraction of true text fragments placed in the correct logical
+  cell (a right value in the wrong cell does not count — that is the value-shifting
+  failure).
+- **blank preservation** — fraction of truly-blank cells left blank (catches a neighbour
+  shifted into an empty position).
+- **schema-column accuracy** — fraction of tables with the right logical-column count (did
+  it resolve the Optional/implicit columns).
+
+These are meaningful only for text-emitting runs (`mode="schema"`/`"full"`); on a
+structure-only run the prediction has no cell text, so content placement reads ~0 **by
+design** — do not read that as a regression.
 
 **Always report bootstrap confidence intervals.** At ~100 eval tables a 2–3 point TEDS
 difference is noise. `compare_runs()` prints `NOT SIGNIFICANT` when intervals overlap;

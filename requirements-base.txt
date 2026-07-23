@@ -10,3 +10,7 @@ opencv-python-headless==4.11.0.86
 numpy==2.2.2
 tqdm==4.67.1
 pytest==8.3.4
+# Model-hub access: repo_id verification (HfApi().model_info) and weight/label
+# downloads. No torch. (datasets already pulls this in; named here so the
+# hub dependency is self-declaring.)
+huggingface_hub==1.24.0

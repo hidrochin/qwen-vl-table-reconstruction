@@ -1,19 +1,28 @@
-"""LoRA fine-tuning for Qwen3-VL via Unsloth.
+"""LoRA fine-tuning for Qwen-VL via Unsloth.
 
-Runs on the GPU box only; every heavy import is deferred so the module still
-imports on a Mac.
+Runs on the GPU box only (Track 1 Lightning for public data, or the company
+RTX 5000 for the private student); every heavy import is deferred so the module
+still imports on a Mac.
 
 Two settings here exist specifically to survive a free-tier environment:
 
 * Checkpoints are written every ``save_steps`` and training resumes from the last
-  one. Colab disconnects, and a run that cannot resume is a run that has to start
-  over -- which on a four-day clock can cost the whole experiment.
+  one. A cloud GPU disconnects, and a run that cannot resume is a run that has to
+  start over -- which on a four-day clock can cost the whole experiment.
 * ``max_pixels`` caps visual tokens. A full-page table can exceed 4,000 image
   tokens on its own; combined with a long HTML target that is enough to OOM a
-  16 GB card partway through an epoch.
+  small card partway through an epoch.
 
-Default target is structure-only HTML. It cuts sequence length 5-10x, matches
-TEDS-Struct, and is what makes an 8B-class model trainable on a small GPU.
+Three things the trainer supports beyond a plain structure run:
+
+* **``mode``** -- ``structure`` (tags only, the trainable-on-a-small-GPU default)
+  or ``schema`` / ``full`` (text-bearing, for the logical-reconstruction task).
+* **``ocr_layouts``** -- per-uid stage-1 grounding, so the *training* prompt
+  matches the grounded/schema *inference* prompt. A mismatch discards most of
+  what the adapter learns (the repo's train/inference prompt-match rule).
+* **``targets``** -- per-uid teacher labels for **distillation SFT**: train the
+  student on a stronger teacher's outputs instead of gold HTML. This is how the
+  phase-two pipeline turns 27B-teacher drafts into an 8B student.
 """
 
 from __future__ import annotations
@@ -24,7 +33,7 @@ from pathlib import Path
 from src.data.html_utils import to_structure_only
 from src.data.loader import TableRecord
 from src.model.inference import DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS, MODEL_4B
-from src.model.prompts import resolve_instruction
+from src.model.prompts import build_training_example
 
 
 @dataclass
@@ -58,54 +67,73 @@ class TrainConfig:
     seed: int = 3407
 
 
+def _target_html(rec: TableRecord, mode: str, targets: dict[str, str] | None) -> str | None:
+    """The assistant-turn HTML for one record.
+
+    ``targets`` (uid -> teacher HTML) overrides the gold label for distillation.
+    Structure mode normalizes through the same path the metric uses, so the model
+    trains on exactly the representation it is scored against.
+    """
+    source = targets.get(rec.uid) if targets else rec.html
+    if source is None:
+        return None
+    target = to_structure_only(source) if mode == "structure" else source
+    return target or None
+
+
 def build_dataset(
-    records: list[TableRecord], mode: str = "structure", instruction: str | None = None
+    records: list[TableRecord],
+    mode: str = "structure",
+    instruction: str | None = None,
+    ocr_layouts: dict[str, str] | None = None,
+    targets: dict[str, str] | None = None,
 ) -> list[dict]:
     """Convert records into Unsloth vision-chat format.
 
-    Targets are normalized through the same code path the metric uses, so the
-    model is trained on exactly the representation it is scored against.
+    ``ocr_layouts`` (uid -> stage-1 grounding) and ``targets`` (uid -> teacher
+    label, for distillation) are both keyed by record uid. Grounding is threaded
+    through ``build_training_example`` so the training prompt is byte-identical to
+    the grounded/schema inference prompt.
     """
     from PIL import Image
 
-    instruction = resolve_instruction(mode, instruction)
     dataset = []
     for rec in records:
-        target = to_structure_only(rec.html) if mode == "structure" else rec.html
+        target = _target_html(rec, mode, targets)
         if not target:
             continue
-        dataset.append(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": Image.open(rec.image_path).convert("RGB")},
-                            {"type": "text", "text": instruction},
-                        ],
-                    },
-                    {"role": "assistant", "content": [{"type": "text", "text": target}]},
-                ]
-            }
-        )
+        layout = ocr_layouts.get(rec.uid) if ocr_layouts else None
+        image = Image.open(rec.image_path).convert("RGB")
+        dataset.append(build_training_example(image, target, mode, instruction, layout))
     return dataset
 
 
 def filter_by_length(
-    records: list[TableRecord], processor, cfg: TrainConfig, margin: int = 512
+    records: list[TableRecord],
+    processor,
+    cfg: TrainConfig,
+    margin: int = 512,
+    ocr_layouts: dict[str, str] | None = None,
+    targets: dict[str, str] | None = None,
 ) -> list[TableRecord]:
-    """Drop samples whose target would overflow ``max_seq_length``.
+    """Drop samples whose prompt+target would overflow ``max_seq_length``.
 
     One pathological table is enough to OOM a run partway through. Losing a few
-    outliers costs less than losing the run.
+    outliers costs less than losing the run. Grounding text counts toward the
+    budget, so it is measured here too when supplied.
     """
     from src.model.inference import visual_token_estimate
     from PIL import Image
 
     kept, dropped = [], 0
     for rec in records:
-        target = to_structure_only(rec.html) if cfg.mode == "structure" else rec.html
+        target = _target_html(rec, cfg.mode, targets)
+        if not target:
+            dropped += 1
+            continue
         text_tokens = len(processor.tokenizer(target).input_ids)
+        if ocr_layouts and ocr_layouts.get(rec.uid):
+            text_tokens += len(processor.tokenizer(ocr_layouts[rec.uid]).input_ids)
         with Image.open(rec.image_path) as im:
             image_tokens = visual_token_estimate(*im.size, cfg.max_pixels)
         if text_tokens + image_tokens + margin <= cfg.max_seq_length:
@@ -118,8 +146,18 @@ def filter_by_length(
     return kept
 
 
-def train(records: list[TableRecord], cfg: TrainConfig | None = None, resume: bool = True):
-    """Fine-tune a LoRA adapter. Returns (model, processor, trainer)."""
+def train(
+    records: list[TableRecord],
+    cfg: TrainConfig | None = None,
+    resume: bool = True,
+    ocr_layouts: dict[str, str] | None = None,
+    targets: dict[str, str] | None = None,
+):
+    """Fine-tune a LoRA adapter. Returns (model, processor, trainer).
+
+    ``ocr_layouts`` grounds the prompt (must match inference); ``targets`` (uid ->
+    teacher HTML) switches from gold-label SFT to teacher distillation.
+    """
     cfg = cfg or TrainConfig()
 
     from unsloth import FastVisionModel  # must precede transformers imports
@@ -149,9 +187,11 @@ def train(records: list[TableRecord], cfg: TrainConfig | None = None, resume: bo
     )
     FastVisionModel.for_training(model)
 
-    records = filter_by_length(records, processor, cfg)
-    dataset = build_dataset(records, cfg.mode, cfg.instruction)
-    print(f"  training on {len(dataset)} samples, mode={cfg.mode}")
+    records = filter_by_length(records, processor, cfg, ocr_layouts=ocr_layouts, targets=targets)
+    dataset = build_dataset(records, cfg.mode, cfg.instruction, ocr_layouts, targets)
+    kind = "distilled from teacher labels" if targets else "gold labels"
+    grounding = ", OCR-grounded" if ocr_layouts else ""
+    print(f"  training on {len(dataset)} samples, mode={cfg.mode}, {kind}{grounding}")
 
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
