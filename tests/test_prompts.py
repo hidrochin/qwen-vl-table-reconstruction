@@ -9,9 +9,13 @@ case below is a shape real models actually emit.
 import pytest
 
 from src.model.prompts import (
+    DEFAULT_INVOICE_SCHEMA,
     FULL_INSTRUCTION,
+    SCHEMA_INSTRUCTION,
     STRUCTURE_INSTRUCTION,
+    append_bbox_rule,
     build_messages,
+    build_schema_instruction,
     build_training_example,
     clean_prediction,
     resolve_instruction,
@@ -102,3 +106,63 @@ class TestMessageShape:
         ex = build_training_example("img.png", TABLE)
         assert [m["role"] for m in ex["messages"]] == ["user", "assistant"]
         assert ex["messages"][1]["content"][0]["text"] == TABLE
+
+
+class TestSchemaInstruction:
+    """The schema path must generalise: teach principles, not one fixed layout."""
+
+    def test_default_is_document_agnostic(self):
+        """The default (no schema arg) must NOT bake in one sample's column names
+        -- that overfits and only works on documents matching that sample."""
+        default = build_schema_instruction()
+        assert default == SCHEMA_INSTRUCTION
+        for hardcoded in ("Currency", "Figure100", "Figures", "Debit", "Credit"):
+            assert hardcoded not in default
+
+    def test_default_teaches_the_reconstruction_principles(self):
+        low = build_schema_instruction().lower()
+        assert "logical" in low
+        assert "blank" in low          # sparse cells preserved
+        assert "variable" in low       # variable column count
+        assert "<th>" in low           # hierarchical headers
+
+    def test_schema_hint_is_included_but_framed_as_a_hint(self):
+        """A supplied header appears verbatim, but as a clue to verify -- never as
+        a structure to force."""
+        with_hint = build_schema_instruction(DEFAULT_INVOICE_SCHEMA)
+        assert "Figure100" in with_hint
+        assert "hint" in with_hint.lower()
+        assert "verify" in with_hint.lower()
+
+    def test_ignore_rule_covers_handwriting_and_qr(self):
+        low = build_schema_instruction().lower()
+        assert "handwritten" in low
+        assert "qr" in low
+        assert "barcode" in low
+
+    def test_warns_about_cropped_clipped_borders(self):
+        """Input is a YOLOX table crop whose outer border may be clipped -- the
+        model must not read a missing edge as a dropped/merged column."""
+        low = build_schema_instruction().lower()
+        assert "crop" in low
+        assert "clip" in low
+        assert "border" in low
+
+    def test_bbox_clamped_to_image(self):
+        low = build_schema_instruction(with_bbox=True).lower()
+        assert "inside the image" in low or "image border" in low
+
+    def test_bbox_off_by_default(self):
+        assert "data-bbox" not in build_schema_instruction()
+
+    def test_with_bbox_requests_per_cell_boxes(self):
+        instr = build_schema_instruction(with_bbox=True)
+        assert "data-bbox" in instr
+        low = instr.lower()
+        assert "x1,y1,x2,y2" in low
+        assert "one box per logical cell" in low
+
+    def test_append_bbox_rule_extends_any_instruction(self):
+        extended = append_bbox_rule(FULL_INSTRUCTION)
+        assert extended.startswith(FULL_INSTRUCTION)
+        assert "data-bbox" in extended
