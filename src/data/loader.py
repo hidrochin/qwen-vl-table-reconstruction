@@ -18,6 +18,7 @@ so they cannot overlap by construction rather than by trusting a split function.
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -42,6 +43,22 @@ FALLBACK_DATASET_ID = "apoidea/pubtabnet-html"
 ROWS_API = "https://datasets-server.huggingface.co/rows"
 PAGE_SIZE = 100  # API maximum
 _TIMEOUT = 60
+# A rate-limit window can be ~a minute; a mid-scan 429 must wait it out and resume
+# rather than dying after a few quick retries. Cap any single sleep so a bad
+# Retry-After header can't stall the build indefinitely.
+_MAX_BACKOFF = 45.0
+
+
+def _hf_headers() -> dict:
+    """Attach a bearer token when one is in the environment.
+
+    The datasets-server rate-limits anonymous paging aggressively (a burst of
+    ~20 page requests trips HTTP 429). An HF token raises the limit substantially,
+    so a full 20k-row scan can complete without throttling. No token -> anonymous,
+    which still works with the backoff below, just slower.
+    """
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 @dataclass
@@ -60,23 +77,35 @@ class TableRecord:
         }
 
 
-def _get(url: str, params: dict | None = None, retries: int = 4):
-    """GET with exponential backoff. The API rate-limits under sustained paging."""
-    delay = 1.0
+def _get(url: str, params: dict | None = None, retries: int = 6, headers: dict | None = None):
+    """GET with backoff that respects Retry-After.
+
+    The datasets-server rate-limits sustained paging (HTTP 429). The old 4-attempt,
+    1-2-4s backoff only bought ~7s -- far short of a rate-limit window -- so a scan
+    died mid-way. This waits out the window (honoring Retry-After when present) and
+    resumes, so the scan finishes slowly instead of failing.
+    """
+    delay = 2.0
     last = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, timeout=_TIMEOUT)
+            resp = requests.get(url, params=params, headers=headers, timeout=_TIMEOUT)
             if resp.status_code == 200:
                 return resp
             if resp.status_code in (429, 502, 503, 504):
                 last = f"HTTP {resp.status_code}"
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = max(delay, float(retry_after))
+                    except ValueError:
+                        pass
             else:
                 resp.raise_for_status()
         except requests.RequestException as exc:
             last = str(exc)
         if attempt < retries - 1:
-            time.sleep(delay)
+            time.sleep(min(delay, _MAX_BACKOFF))
             delay *= 2
     raise RuntimeError(f"request failed after {retries} attempts ({last}): {url}")
 
@@ -91,6 +120,7 @@ def _fetch_page(dataset_id: str, split: str, offset: int, length: int) -> list[d
             "offset": offset,
             "length": length,
         },
+        headers=_hf_headers(),
     )
     return resp.json().get("rows", [])
 
@@ -107,6 +137,7 @@ def select_hard_tables(
     dataset_id: str = DATASET_ID,
     require_spanning: bool = True,
     progress_every: int = 1000,
+    pause: float = 0.3,
 ) -> tuple[list[dict], list[float]]:
     """Scan a split and return the ``n_target`` hardest tables, plus all scores.
 
@@ -128,6 +159,10 @@ def select_hard_tables(
         rows = _fetch_page(dataset_id, split, offset, min(PAGE_SIZE, max_scanned - offset))
         if not rows:
             break
+        # Space out requests so anonymous paging stays under the rate limit rather
+        # than bursting into a 429 and relying on backoff to recover.
+        if pause:
+            time.sleep(pause)
 
         for row in rows:
             data = row.get("row", {})
