@@ -29,9 +29,10 @@ python notebook/eval.py  --corpus data/corpus --model qwen3-vl-4b \
 
 ```bash
 pip install -r requirements-base.txt && pip install -r requirements-onprem.txt
-vllm serve Qwen/Qwen3.6-27B --port 8000 --quantization fp8   # the teacher
+vllm serve Qwen/Qwen3.6-35B-A3B-FP8 --port 8000 \
+    --no-enable-prefix-caching --limit-mm-per-prompt image=4   # the teacher
 ```
-then, in order: `teacher-label-tables.ipynb` (27B drafts labels) → human-correct →
+then, in order: `teacher-label-tables.ipynb` (teacher drafts labels) → human-correct →
 `finetune-and-serve.ipynb` (distil the 8B student, serve with `--enable-lora`, A/B) →
 `two-stage-reconstruct.ipynb` (the schema-inference pipeline on one invoice). Nothing
 leaves the network.
@@ -441,15 +442,24 @@ public FinTabNet on Lightning/Colab. This runs on **company hardware only** —
 invoices are confidential and **must not leave the network**. No Colab, no
 third-party cloud. Both notebooks below call `localhost` and nothing else.
 
-Three notebooks form the **two-stage distillation loop**: the served **Qwen3.6-27B
-dense teacher** (vision + thinking — stronger on schema *reasoning* than the 35B-A3B MoE)
-drafts logical-HTML labels for the unlabeled invoices via the two-stage path, and those
-`(image, html)` pairs distil the 8B student that gets served. `two-stage-reconstruct.ipynb`
-is the standalone pipeline demo. (`Qwen/Qwen3.6-35B-A3B` remains a config swap-in.)
+Three notebooks form the **two-stage distillation loop**: the served
+**Qwen3.6-35B-A3B-FP8 teacher** (vision + thinking; the plan is pinned to this
+checkpoint) drafts logical-HTML labels for the unlabeled invoices via the two-stage
+path, and those `(image, html)` pairs distil the 8B student that gets served.
+`two-stage-reconstruct.ipynb` is the standalone pipeline demo — including the
+JSON cell-list output (`src/model/cells.py`, boxes structurally mandatory via
+`guided_json`) and multi-page tables (a list of page crops per predict call).
+(`Qwen/Qwen3.6-27B` dense remains a config swap-in.)
+
+**One instruction everywhere.** All three notebooks build the same
+`INSTRUCTION = build_schema_instruction(with_bbox=True)`. A call that builds its
+own variant (different `with_bbox`, different schema hint) is exactly the bug that
+made `data-bbox` appear on one call and vanish on the next — and it breaks the
+train/inference prompt-match rule.
 
 | Runs on the L40 (serving) | Runs on the RTX 5000 (training) |
 |---|---|
-| 27B teacher labelling (`teacher-label-tables.ipynb`) | LoRA distillation (`finetune-and-serve.ipynb`) |
+| teacher labelling (`teacher-label-tables.ipynb`) | LoRA distillation (`finetune-and-serve.ipynb`) |
 | vLLM serve base + adapter (`--enable-lora`) | — |
 | live base-vs-adapter A/B | — |
 
@@ -458,12 +468,12 @@ is the standalone pipeline demo. (`Qwen/Qwen3.6-35B-A3B` remains a config swap-i
 > nothing to score against. The visible A/B win will be mostly output-format
 > alignment. That is the honest read — do not oversell it.
 
-### 8.1 Label the invoices with the 27B teacher (`teacher-label-tables.ipynb`)
+### 8.1 Label the invoices with the teacher (`teacher-label-tables.ipynb`)
 
 Put the invoice images in `data/invoices/`. Confirm the teacher is up:
 
 ```bash
-curl -s http://localhost:8000/v1/models | python -m json.tool   # expect Qwen/Qwen3.6-27B
+curl -s http://localhost:8000/v1/models | python -m json.tool   # expect Qwen/Qwen3.6-35B-A3B-FP8
 ```
 
 In the notebook, set `BASE_URL` / `MODEL_NAME` to match `--served-model-name`,

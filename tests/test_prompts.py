@@ -15,9 +15,11 @@ from src.model.prompts import (
     STRUCTURE_INSTRUCTION,
     append_bbox_rule,
     build_messages,
+    build_prompt_text,
     build_schema_instruction,
     build_training_example,
     clean_prediction,
+    format_layout_block,
     resolve_instruction,
 )
 
@@ -106,6 +108,46 @@ class TestMessageShape:
         ex = build_training_example("img.png", TABLE)
         assert [m["role"] for m in ex["messages"]] == ["user", "assistant"]
         assert ex["messages"][1]["content"][0]["text"] == TABLE
+
+
+class TestMultiImage:
+    """A long table split across page crops goes in as an ordered image list."""
+
+    def test_image_list_becomes_one_turn_with_all_pages(self):
+        msgs = build_messages(["p1.png", "p2.png"], "structure")
+        kinds = [c["type"] for c in msgs[0]["content"]]
+        assert kinds == ["image", "image", "text"]
+        assert [c["image"] for c in msgs[0]["content"][:2]] == ["p1.png", "p2.png"]
+
+    def test_multi_page_note_added_iff_several_images(self):
+        single = build_messages("p1.png", "structure")[0]["content"][-1]["text"]
+        multi = build_messages(["p1.png", "p2.png"], "structure")[0]["content"][-1]["text"]
+        assert "SINGLE logical table" not in single
+        assert "SINGLE logical table" in multi
+        assert "2 images" in multi
+        # positions must say which page they belong to
+        assert "data-page" in multi
+
+    def test_multi_page_note_covers_the_stitching_failures(self):
+        text = build_prompt_text(3, "structure").lower()
+        assert "header only once" in text        # continuation header not duplicated
+        assert "one row" in text                 # row cut at the page break merged
+        assert "3 images" in text
+
+    def test_single_image_prompt_unchanged(self):
+        """The n=1 path must stay byte-identical to the pre-multi-image prompt."""
+        assert build_prompt_text(1, "structure") == STRUCTURE_INSTRUCTION
+
+    def test_per_page_layout_blocks_are_numbered(self):
+        block = format_layout_block(["A | B", "C | D"])
+        assert '<ocr_layout page="1">' in block
+        assert '<ocr_layout page="2">' in block
+        assert block.index("A | B") < block.index("C | D")
+
+    def test_single_layout_block_unchanged(self):
+        block = format_layout_block("A | B")
+        assert "<ocr_layout>" in block
+        assert "page=" not in block
 
 
 class TestSchemaInstruction:

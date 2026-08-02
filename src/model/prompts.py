@@ -97,34 +97,45 @@ _CROPPED_TABLE_NOTE = (
     "is cut, and still read a value that sits at a slightly clipped edge."
 )
 
-_SCHEMA_PRINCIPLES = (
-    "How to reconstruct:\n"
-    "1. Infer the logical schema from the whole table, not the header alone. The "
+# The reconstruction principles, unnumbered. The final item is the only
+# HTML-specific one; ``cells.py`` reuses items [:-1] and swaps in a JSON-output
+# version of it, so edit the shared items here once for both output formats.
+_SCHEMA_PRINCIPLE_ITEMS: tuple[str, ...] = (
+    "Infer the logical schema from the whole table, not the header alone. The "
     "header is hierarchical: parent headers span several child columns, and some "
     "child columns are implied by the body and never printed. Decide how many "
     "logical columns exist, and what each means, from vertical alignment, value "
-    "semantics, and neighbouring values.\n"
-    "2. The logical column count is VARIABLE across documents. An optional or "
+    "semantics, and neighbouring values.",
+    "The logical column count is VARIABLE across documents. An optional or "
     "implicit column exists only when the body actually supplies values for it. "
     "Do not add a column the body does not support, and do not drop one it does. "
-    "The printed header does not signal this -- the body does.\n"
-    "3. Assign every printed text fragment to exactly one logical cell. Never "
-    "invent, duplicate, move, or drop a value.\n"
-    "4. Keep blank cells blank. A blank is real content: never shift a "
+    "The printed header does not signal this -- the body does.",
+    "Assign every printed text fragment to exactly one logical cell. Never "
+    "invent, duplicate, move, or drop a value.",
+    "Keep blank cells blank. A blank is real content: never shift a "
     "neighbouring value into an empty position, and never merge two logical "
-    "columns just because one is sparse.\n"
-    "5. Rows are grouped. A section/group row (a label that starts a block) "
+    "columns just because one is sparse.",
+    "Rows are grouped. A section/group row (a label that starts a block) "
     "carries text only in its first logical column; every other cell in that row "
     "is empty. A summary row (e.g. a total) is an ordinary row with values in "
-    "only some columns.\n"
-    "6. Rows and columns are often separated by alignment and spacing, not printed "
+    "only some columns.",
+    "Rows and columns are often separated by alignment and spacing, not printed "
     "lines. Use value semantics (a numeric column stays numeric, a symbol column "
     "stays symbols, a percentage/amount column stays that type) together with "
-    "geometry to keep each value in the correct row and column.\n"
-    "7. Use <th> for header cells and preserve every parent/child relationship "
+    "geometry to keep each value in the correct row and column.",
+    "Use <th> for header cells and preserve every parent/child relationship "
     "with rowspan/colspan. Preserve merged cells in headers, section rows, and "
-    "summary rows."
+    "summary rows.",
 )
+
+
+def number_principles(items: tuple[str, ...]) -> str:
+    """Join principle items into the numbered 'How to reconstruct' block."""
+    body = "\n".join(f"{i}. {text}" for i, text in enumerate(items, 1))
+    return f"How to reconstruct:\n{body}"
+
+
+_SCHEMA_PRINCIPLES = number_principles(_SCHEMA_PRINCIPLE_ITEMS)
 
 _IGNORE_RULE = (
     "Ignore everything that is not part of the printed data table: handwritten "
@@ -150,7 +161,30 @@ _BBOX_RULE = (
     "positions are given, the union of the fragments you assigned to that cell). "
     "Give a truly blank cell no data-bbox -- it has nothing to bound. Keep every "
     "coordinate inside the image: for a cell at a clipped edge, extend its box to "
-    "the image border rather than past it."
+    "the image border rather than past it. These data-bbox attributes are required "
+    "in every response, on every request, even when a request repeats an earlier "
+    "image -- never drop them."
+)
+
+# Appended automatically by ``build_messages`` when it receives more than one
+# image: a long table split across page crops must come back as ONE logical
+# table, and the classic failures are a re-emitted continuation header and a
+# row at the page break either duplicated or torn in two.
+_MULTI_PAGE_NOTE = (
+    "You are given {n} images. They are consecutive crops of ONE table that "
+    "continues across pages, in reading order (image 1 is the top). Reconstruct "
+    "them as a SINGLE logical table:\n"
+    "- If a later image repeats the header (a continuation header), recognise it "
+    "and emit the header only once, at the top.\n"
+    "- A row cut by the page break (its text starts at the bottom of one image "
+    "and continues at the top of the next) is ONE row -- merge it, do not emit "
+    "it twice or as two rows.\n"
+    "- Column boundaries are the same in every image: align the pages by their "
+    "columns, and carry section groups that started on an earlier page across "
+    "the break.\n"
+    "- Wherever a pixel position is reported (data-bbox or cell boxes), also "
+    'give the 1-based image it belongs to as data-page="N", with coordinates in '
+    "that image's own pixel space."
 )
 
 _OUTPUT_PLAIN = (
@@ -226,12 +260,26 @@ INSTRUCTIONS = {
 }
 
 
-def format_layout_block(ocr_layout: str) -> str:
+def format_layout_block(ocr_layout: str | list[str]) -> str:
     """Wrap the OCR layout in a delimited block for the user turn.
 
     Delimiters keep the grounding text from bleeding into the instruction and
     give the model a clear region to treat as source-of-truth for cell text.
+    A list means one layout per page image, in the same order the images are
+    given; each page gets its own tagged block so fragment positions stay tied
+    to the right image's pixel space.
     """
+    if isinstance(ocr_layout, list):
+        blocks = "\n".join(
+            f'<ocr_layout page="{i}">\n{layout}\n</ocr_layout>'
+            for i, layout in enumerate(ocr_layout, 1)
+        )
+        return (
+            "OCR text and layout extracted from each image (page numbers match "
+            "the image order; positions are in that page's own pixels) -- use it "
+            "as the source of cell text and positions; do not re-read the pixels "
+            f"for text:\n{blocks}"
+        )
     return (
         "OCR text and layout extracted from the image -- use it as the source of "
         "cell text and positions; do not re-read the pixels for text:\n"
@@ -254,33 +302,54 @@ def resolve_instruction(mode: str = "structure", instruction: str | None = None)
     return INSTRUCTIONS[mode]
 
 
+def as_image_list(image) -> list:
+    """Normalize the ``image`` argument: one image or an ordered page list."""
+    return list(image) if isinstance(image, (list, tuple)) else [image]
+
+
+def build_prompt_text(
+    n_images: int,
+    mode: str = "structure",
+    instruction: str | None = None,
+    ocr_layout: str | list[str] | None = None,
+) -> str:
+    """Assemble the full user-turn text: instruction, multi-page note, OCR block.
+
+    Shared by the local and the served (vllm_client) paths so a multi-page call
+    is prompted identically regardless of backend.
+    """
+    text = resolve_instruction(mode, instruction)
+    if n_images > 1:
+        text = f"{text}\n\n{_MULTI_PAGE_NOTE.format(n=n_images)}"
+    if ocr_layout:
+        text = f"{text}\n\n{format_layout_block(ocr_layout)}"
+    return text
+
+
 def build_messages(
     image,
     mode: str = "structure",
     instruction: str | None = None,
-    ocr_layout: str | None = None,
+    ocr_layout: str | list[str] | None = None,
 ) -> list[dict]:
-    """Build a Qwen-VL chat message list for one table image.
+    """Build a Qwen-VL chat message list for one table (one or more images).
 
-    ``image`` may be a PIL image or a path; qwen-vl-utils accepts both.
+    ``image`` may be a PIL image or a path (qwen-vl-utils accepts both), or a
+    **list** of them when one long table is split across several page crops --
+    the images go in reading order and the multi-page stitching note is added
+    automatically.
 
     ``ocr_layout`` (Option A) is appended to the same text block rather than
     added as a second content item -- a single text turn is what every VL
-    processor accepts, and it keeps the ``[image, text]`` shape stable. Omit it
-    and the message is byte-for-byte the ungrounded one.
+    processor accepts, and it keeps the ``[images..., text]`` shape stable. Pass
+    a list (one layout per page) with multi-image input. Omit it and a
+    single-image message is byte-for-byte the ungrounded one.
     """
-    text = resolve_instruction(mode, instruction)
-    if ocr_layout:
-        text = f"{text}\n\n{format_layout_block(ocr_layout)}"
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": text},
-            ],
-        }
-    ]
+    images = as_image_list(image)
+    text = build_prompt_text(len(images), mode, instruction, ocr_layout)
+    content: list[dict] = [{"type": "image", "image": im} for im in images]
+    content.append({"type": "text", "text": text})
+    return [{"role": "user", "content": content}]
 
 
 def build_training_example(

@@ -3,11 +3,16 @@
 This replaces the old hosted-API bake-off path. Nothing here calls a third-party
 service: on the company server (Track 2) you serve a model once --
 
-    vllm serve Qwen/Qwen3.6-27B --enable-lora --port 8000
+    vllm serve Qwen/Qwen3.6-35B-A3B-FP8 --enable-lora --port 8000 \
+        --no-enable-prefix-caching --limit-mm-per-prompt image=4
 
 -- and hit ``http://localhost:8000/v1`` over the loopback. The 20 confidential
 invoices never leave the network, and LoRA adapters hot-load via ``--enable-lora``
 so base-vs-adapter A/B is possible against the same served weights.
+``--no-enable-prefix-caching`` is for labelling runs: multimodal prefix-cache
+hits have produced degraded repeat-call outputs on some vLLM versions, and a
+labelling pass re-sends near-identical prompts constantly. ``image=4`` allows
+multi-page tables (a list of page crops in one request).
 
 It mirrors ``TableReconstructor``'s ``predict`` / ``predict_many`` surface and
 returns the same ``Prediction``, so everything downstream -- TEDS-Struct, the new
@@ -30,8 +35,8 @@ import mimetypes
 from pathlib import Path
 
 from src.model.inference import Prediction, predictions_dict  # noqa: F401  (re-export)
-from src.model.registry import MODEL_QWEN36_27B
-from src.model.prompts import clean_prediction, format_layout_block, resolve_instruction
+from src.model.registry import MODEL_QWEN36_35B_FP8
+from src.model.prompts import as_image_list, build_prompt_text, clean_prediction
 
 
 def image_to_data_uri(image_path: str | Path, max_side: int | None = 1536) -> str:
@@ -73,7 +78,7 @@ class VLLMTableReconstructor:
 
     def __init__(
         self,
-        model_id: str = MODEL_QWEN36_27B,
+        model_id: str = MODEL_QWEN36_35B_FP8,
         base_url: str = "http://localhost:8000/v1",
         api_key: str = "EMPTY",
         max_side: int | None = 1536,
@@ -96,38 +101,37 @@ class VLLMTableReconstructor:
 
     def predict(
         self,
-        image_path: str | Path,
+        image_path: str | Path | list[str | Path],
         mode: str = "structure",
         max_new_tokens: int = 2048,
         instruction: str | None = None,
-        ocr_layout: str | None = None,
+        ocr_layout: str | list[str] | None = None,
         guided_regex: str | None = None,
         guided_grammar: str | None = None,
         guided_json: dict | None = None,
     ) -> Prediction:
-        """Generate HTML for one image via the served endpoint.
+        """Generate HTML for one table -- one image, or a page list for a long
+        table split across several crops (reading order; the multi-page
+        stitching note is added automatically).
 
         Signature matches the local ``predict`` (``instruction`` overrides the
-        mode prompt; ``ocr_layout`` supplies stage-1 grounding) so a run script
-        is agnostic to which backend it holds. The ``guided_*`` args force valid
-        output via vLLM guided decoding.
+        mode prompt; ``ocr_layout`` supplies stage-1 grounding -- pass a list,
+        one layout per page, with multi-image input) so a run script is agnostic
+        to which backend it holds. The ``guided_*`` args force valid output via
+        vLLM guided decoding.
         """
-        text = resolve_instruction(mode, instruction)
-        if ocr_layout:
-            text = f"{text}\n\n{format_layout_block(ocr_layout)}"
+        paths = as_image_list(image_path)
+        text = build_prompt_text(len(paths), mode, instruction, ocr_layout)
 
-        messages = [
+        content: list[dict] = [
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_to_data_uri(image_path, self.max_side)},
-                    },
-                    {"type": "text", "text": text},
-                ],
+                "type": "image_url",
+                "image_url": {"url": image_to_data_uri(p, self.max_side)},
             }
+            for p in paths
         ]
+        content.append({"type": "text", "text": text})
+        messages = [{"role": "user", "content": content}]
 
         extra_body: dict = {}
         if guided_regex:
@@ -147,19 +151,22 @@ class VLLMTableReconstructor:
             extra_body=extra_body or None,
         )
         raw = completion.choices[0].message.content or ""
-        return Prediction(uid=Path(image_path).stem, raw=raw, html=clean_prediction(raw))
+        return Prediction(uid=Path(paths[0]).stem, raw=raw, html=clean_prediction(raw))
 
     def predict_many(
         self,
-        image_paths: list[str | Path],
+        image_paths: list,
         mode: str = "structure",
-        ocr_layouts: list[str] | None = None,
+        ocr_layouts: list | None = None,
         **kwargs,
     ) -> list[Prediction]:
         """Sequential generation with progress, matching the local path.
 
-        ``ocr_layouts`` is per-image and aligned to ``image_paths``; ``**kwargs``
-        (``instruction``, ``guided_*``) is shared across all images.
+        Each entry of ``image_paths`` is one *table*: a single path, or a list of
+        page paths for a table split across crops. ``ocr_layouts`` is per-table
+        and aligned to ``image_paths`` (itself a per-page list for a multi-page
+        entry); ``**kwargs`` (``instruction``, ``guided_*``) is shared across all
+        tables.
         """
         if ocr_layouts is not None and len(ocr_layouts) != len(image_paths):
             raise ValueError(
