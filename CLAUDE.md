@@ -54,19 +54,26 @@ src/model/   registry.py (single source of truth for model roles), prompts
              schema_infer.py (per-document schema discovery: dossier → Qwen candidates →
              deterministic trial scoring → deferred commitment), paddle_client.py +
              mineru_client.py (specialists), docparse_utils.py (shared parsing)
+src/pipeline.py  StagedPipeline — the end-to-end assembly (read → survey → schema →
+             grounded cells → k-vote → verify → bounded monotone repair → serialize);
+             model calls injected (from_client wires a served endpoint), Mac-testable
 src/train/   Unsloth LoRA — structure / schema / OCR-grounded / teacher-distillation
 src/demo/    side-by-side comparison renderer
-notebook/    Track-1 drivers (bakeoff/train/eval .py); Track-2 notebooks live at repo root
+notebook/    Track-1 drivers (bakeoff/train/eval .py); Track-2 notebooks + run_pipeline.py
+             (the staged-pipeline CLI) live at repo root
 tests/       run these before trusting any number
 ```
 
 The staged-reconstruction modules above (`valuetypes`, `read`, `verify`, `schema_infer`,
 the `layout` survey, the `cells` fragment path) implement `pipeline_design.md` — the
 Qwen-only logical-reconstruction architecture that supersedes the two-stage
-PaddleOCR/MinerU framing further down. Heavy work (the model calls in `read`/`schema_infer`,
-PIL in `verify`/`read`) is injected or deferred; the deterministic cores are unit-tested on
-the Mac. Specialists (`paddle_client`/`mineru_client`) are retained but de-scoped to future
-work (independent-witness OCR), not on the main path.
+PaddleOCR/MinerU framing further down. **`src/pipeline.py` is the runnable assembly of
+them**, driven on the company GPU box by the `run_pipeline.py` CLI or
+`two-stage-reconstruct.ipynb` §6 (`vllm serve` → `StagedPipeline.from_client`). Heavy work
+(the model calls in `read`/`schema_infer`, PIL in `verify`/`read`) is injected or deferred;
+the deterministic cores and the orchestration are unit-tested on the Mac. Specialists
+(`paddle_client`/`mineru_client`) are retained but de-scoped to future work
+(independent-witness OCR), not on the main path.
 
 ### Status: what has actually been run
 
@@ -77,13 +84,18 @@ no torch/vllm/paddle** — the deferred-import invariant holds.
 
 The `pipeline_design.md` modules land as pure-Python cores with the model/PIL calls
 injected or deferred, and are covered by Mac unit tests (`tests/test_valuetypes.py`,
-`test_read.py`, `test_verify.py`, `test_survey.py`, `test_schema_infer.py`, and the
-fragment-path additions in `test_cells.py`): value typing, tiling + cross-read consensus,
-the verifier families, the survey's track/row typing, and schema trial-scoring +
-deferred commitment (including the spec's 2- vs 3-child optional-column case). **Not yet
-run on a GPU:** the reading-pass and schema-discovery *model* calls, and the end-to-end
-staged loop — treat the first served run as a debugging session, and gate further staging
-on the B-vs-A ablation (`pipeline_design.md` §7-8).
+`test_read.py`, `test_verify.py`, `test_survey.py`, `test_schema_infer.py`,
+`test_pipeline.py`, and the fragment-path additions in `test_cells.py`): value typing,
+tiling + cross-read consensus, the verifier families, the survey's track/row typing, schema
+trial-scoring + deferred commitment (including the spec's 2- vs 3-child optional-column
+case), and the full-pipeline orchestration (k-vote, monotone repair accept/reject,
+schema-hint wiring) exercised with fake model callables. The end-to-end loop is now **wired
+and runnable** — `src/pipeline.py` + `run_pipeline.py` + `two-stage-reconstruct.ipynb` §6,
+with `vllm_client` extended to encode PIL crops and to make a text-only schema call. **Not
+yet run on a GPU:** the reading-pass and schema-discovery *model* calls and the end-to-end
+staged loop against a live endpoint — treat the first served run as a debugging session
+(start with one image; check the fragment count, column count, and problem list), and gate
+further staging on the B-vs-A ablation (`--no-schema`, `pipeline_design.md` §7-8).
 
 **Not verified — treat the first run as a debugging session:**
 - `inference.py` (transformers/unsloth/**vLLM** backends), `train/lora.py` — never executed
