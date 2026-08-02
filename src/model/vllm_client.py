@@ -39,30 +39,37 @@ from src.model.registry import MODEL_QWEN36_35B_FP8
 from src.model.prompts import as_image_list, build_prompt_text, clean_prediction
 
 
-def image_to_data_uri(image_path: str | Path, max_side: int | None = 1536) -> str:
+def image_to_data_uri(image, max_side: int | None = 1536) -> str:
     """Base64 data URI for the chat ``image_url`` field.
 
-    ``max_side`` downscales the longer edge before encoding -- the served model
-    still tokenizes by resolution, so capping it is the endpoint analogue of
-    ``max_pixels``. Set ``None`` to send the image untouched. PIL is imported
-    lazily so callers passing already-small images pay nothing.
+    ``image`` is a path **or an in-memory PIL image** -- the reading pass tiles a
+    page into PIL crops and never touches disk, so the client must encode those
+    directly (this is what makes ``ReadingPass``'s ``predict_fn`` wrap this
+    client). ``max_side`` downscales the longer edge before encoding -- the served
+    model still tokenizes by resolution, so capping it is the endpoint analogue of
+    ``max_pixels``. Set ``None`` to send a path's bytes untouched. PIL is imported
+    lazily so a path sent at full resolution pays nothing.
     """
-    path = Path(image_path)
-    if max_side is not None:
+    is_pil = hasattr(image, "convert") and not isinstance(image, (str, Path))
+    if is_pil or max_side is not None:
         import io
 
         from PIL import Image
 
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            if max(im.size) > max_side:
-                scale = max_side / max(im.size)
-                im = im.resize((round(im.width * scale), round(im.height * scale)))
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=90)
-            data = buf.getvalue()
+        if is_pil:
+            im = image.convert("RGB")
+        else:
+            with Image.open(image) as src:
+                im = src.convert("RGB")
+        if max_side is not None and max(im.size) > max_side:
+            scale = max_side / max(im.size)
+            im = im.resize((round(im.width * scale), round(im.height * scale)))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90)
+        data = buf.getvalue()
         mime = "image/jpeg"
     else:
+        path = Path(image)
         data = path.read_bytes()
         mime = mimetypes.guess_type(str(path))[0] or "image/png"
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
@@ -101,7 +108,7 @@ class VLLMTableReconstructor:
 
     def predict(
         self,
-        image_path: str | Path | list[str | Path],
+        image_path,
         mode: str = "structure",
         max_new_tokens: int = 2048,
         instruction: str | None = None,
@@ -109,16 +116,21 @@ class VLLMTableReconstructor:
         guided_regex: str | None = None,
         guided_grammar: str | None = None,
         guided_json: dict | None = None,
+        temperature: float = 0.0,
+        seed: int | None = None,
     ) -> Prediction:
         """Generate HTML for one table -- one image, or a page list for a long
         table split across several crops (reading order; the multi-page
-        stitching note is added automatically).
+        stitching note is added automatically). Each image may be a path or an
+        in-memory PIL image (the reading pass passes crops).
 
         Signature matches the local ``predict`` (``instruction`` overrides the
         mode prompt; ``ocr_layout`` supplies stage-1 grounding -- pass a list,
         one layout per page, with multi-image input) so a run script is agnostic
         to which backend it holds. The ``guided_*`` args force valid output via
-        vLLM guided decoding.
+        vLLM guided decoding. ``temperature``>0 with a per-draft ``seed`` is how
+        the staged pipeline draws the diverse drafts it votes over; both default
+        to the deterministic single-answer setting.
         """
         paths = as_image_list(image_path)
         text = build_prompt_text(len(paths), mode, instruction, ocr_layout)
@@ -143,15 +155,92 @@ class VLLMTableReconstructor:
         # Qwen3.6 thinking toggle rides in extra_body too; harmless if unsupported.
         extra_body["chat_template_kwargs"] = {"enable_thinking": self.thinking}
 
+        kwargs: dict = {}
+        if seed is not None:
+            kwargs["seed"] = seed
         completion = self._get_client().chat.completions.create(
             model=self.model_id,
             messages=messages,
             max_tokens=max_new_tokens,
-            temperature=0.0,  # structure reconstruction has one right answer
+            temperature=temperature,  # 0.0 = the one right answer; >0 for vote drafts
             extra_body=extra_body or None,
+            **kwargs,
         )
         raw = completion.choices[0].message.content or ""
-        return Prediction(uid=Path(paths[0]).stem, raw=raw, html=clean_prediction(raw))
+        first = paths[0]
+        uid = Path(first).stem if isinstance(first, (str, Path)) else "image"
+        return Prediction(uid=uid, raw=raw, html=clean_prediction(raw))
+
+    def generate_text(
+        self,
+        instruction: str,
+        guided_json: dict | None = None,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.0,
+        seed: int | None = None,
+    ) -> str:
+        """Text-only completion -- no image attached.
+
+        The schema-discovery stage reasons over an evidence *dossier* (text), not
+        the pixels, so it needs a call with no image; ``predict`` always attaches
+        one. Returns the raw string (guided-JSON candidates), which
+        ``schema_infer.parse_candidates`` consumes.
+        """
+        messages = [{"role": "user", "content": [{"type": "text", "text": instruction}]}]
+        extra_body: dict = {"chat_template_kwargs": {"enable_thinking": self.thinking}}
+        if guided_json:
+            extra_body["guided_json"] = guided_json
+        kwargs: dict = {}
+        if seed is not None:
+            kwargs["seed"] = seed
+        completion = self._get_client().chat.completions.create(
+            model=self.model_id,
+            messages=messages,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            extra_body=extra_body,
+            **kwargs,
+        )
+        return completion.choices[0].message.content or ""
+
+    # --- adapters for the staged pipeline (src/pipeline.py) --------------------
+    # Each returns a bare callable matching one injected slot, so the pipeline is
+    # backend-agnostic and Mac-testable with fakes while the notebook wires the
+    # real endpoint in one line: ``StagedPipeline.from_client(client)``.
+
+    def as_read_fn(self, *, max_new_tokens: int = 2048):
+        """``(image, instruction, guided_json) -> raw`` for ``ReadingPass``/reread."""
+
+        def _read(image, instruction, guided_json=None):
+            return self.predict(
+                image, instruction=instruction, guided_json=guided_json,
+                max_new_tokens=max_new_tokens,
+            ).raw
+
+        return _read
+
+    def as_generate_fn(self, *, max_new_tokens: int = 2048):
+        """``(instruction, guided_json) -> raw`` for schema discovery (text-only)."""
+
+        def _gen(instruction, guided_json=None):
+            return self.generate_text(
+                instruction, guided_json=guided_json, max_new_tokens=max_new_tokens
+            )
+
+        return _gen
+
+    def as_cell_fn(self, *, max_new_tokens: int = 4096):
+        """``(image, instruction, ocr_layout, guided_json, temperature, seed) -> raw``
+        for grounded cell generation, its k vote-drafts, and the repair round-trip."""
+
+        def _cell(image, instruction, ocr_layout=None, guided_json=None, temperature=0.0, seed=None):
+            return self.predict(
+                image, instruction=instruction, ocr_layout=ocr_layout,
+                guided_json=guided_json, max_new_tokens=max_new_tokens,
+                temperature=temperature, seed=seed,
+            ).raw
+
+        return _cell
 
     def predict_many(
         self,

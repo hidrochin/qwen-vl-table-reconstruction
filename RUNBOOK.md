@@ -553,3 +553,59 @@ This is steps (1)–(2) of the production order in
 needs a human-corrected eval set (the 20 invoices) and trainable volume (synthetic
 invoices) before a fine-tune number means anything. **Data is the bottleneck, not
 the model.**
+
+---
+
+### 8.5 Run the full Qwen-only staged pipeline (read → survey → schema → cells → verify)
+
+This is the `pipeline_design.md` Architecture-A path assembled end to end
+(`src/pipeline.py`), and it supersedes the ad-hoc grounding in §8.1's two-stage
+call: **Qwen does its own OCR** (tiled, structure-blind reading pass), a
+deterministic survey measures the geometry, Qwen abduces a per-document schema
+that a deterministic trial scorer *tests*, the cells are emitted as fragment-id
+references (invention impossible, drops computable), k drafts are voted, and a
+layout-independent verifier drives a bounded, monotone repair. It is all local —
+the client hits loopback, nothing leaves the box.
+
+Serve the teacher (same as §8, `image=4` so a long table's page crops fit one
+request):
+
+```bash
+vllm serve Qwen/Qwen3.6-35B-A3B-FP8 --port 8000 \
+    --no-enable-prefix-caching --limit-mm-per-prompt image=4
+curl -s http://localhost:8000/v1/models | python -m json.tool   # confirm it is up
+```
+
+Then reconstruct a table with the CLI (`run_pipeline.py`, repo root):
+
+```bash
+python run_pipeline.py data/invoices/0001.png --k 3 --draw
+python run_pipeline.py page1.png page2.png --out long_table.html   # ONE long table
+python run_pipeline.py data/invoices/0001.png --no-schema          # Architecture-B baseline
+```
+
+It writes `<image>_reconstructed.html` and `..._reconstructed.json` (the cell
+payload) beside the first image, and with `--draw` a per-cell box overlay. It
+prints the fragment count, the discovered logical columns, the verifier's
+**problems** (repairable) and **flags** (ink-in-blank / arithmetic near-miss /
+`ocr_missed` — for a re-read or a human), the per-stage notes, and an
+uncalibrated triage confidence. `two-stage-reconstruct.ipynb` §6 runs the exact
+same `StagedPipeline` for an inline, visual walkthrough.
+
+Knobs (all `--flags`, and the `StagedPipeline(...)` kwargs behind them):
+
+| flag | what it does | when to change it |
+|---|---|---|
+| `--k` | cell-list vote drafts; k>1 gives per-cell confidence | raise to 3–5 on noisy tables |
+| `--repair-rounds` | max bounded, monotone repair rounds | 1 is usually enough; 0 to see raw |
+| `--consensus` | extra reading-pass tiling offsets | raise if faint print is missed |
+| `--no-schema` | skip schema discovery (the go/no-go baseline) | the **B-vs-A ablation** |
+| `--tile` / `--max-side` | reading tile size / send-side downscale | small print vs token budget |
+
+> **First run is a debugging session** — the reading-pass and schema-discovery
+> *model* calls and the end-to-end loop have never touched a GPU (only the
+> deterministic cores are Mac-tested). Start with **one** image and read the raw
+> output: check the fragment count is plausible (the reading pass actually found
+> the ink), that `logical columns` matches the table, and that `problems` is short.
+> The `--no-schema` vs default comparison **is** ablation #1 (`pipeline_design.md`
+> §8) — gate building any more staging on it beating the hint-free baseline.
