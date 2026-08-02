@@ -15,7 +15,13 @@ CELL_TAGS = ("td", "th")
 
 @dataclass(frozen=True)
 class Cell:
-    """A table cell with its declared spans and 0-indexed grid anchor."""
+    """A table cell with its declared spans and 0-indexed grid anchor.
+
+    ``bbox`` is the cell's ``data-bbox`` from a ``with_bbox`` prediction, as pixel
+    corners ``(x1, y1, x2, y2)`` -- top-left and bottom-right, ready to hand to a
+    drawing library. It is ``None`` for a blank cell or any output without boxes.
+    Note the corner form differs from ``OcrWord.bbox`` (which is ``(x, y, w, h)``).
+    """
 
     row: int
     col: int
@@ -23,6 +29,7 @@ class Cell:
     colspan: int
     tag: str
     text: str
+    bbox: tuple[int, int, int, int] | None = None
 
     @property
     def is_spanning(self) -> bool:
@@ -59,6 +66,26 @@ def _span(el: lxml.html.HtmlElement, attr: str) -> int:
         return 1
 
 
+def _parse_bbox(el: lxml.html.HtmlElement) -> tuple[int, int, int, int] | None:
+    """Parse a ``data-bbox="x1,y1,x2,y2"`` attribute into integer pixel corners.
+
+    Tolerant like ``_span``: models emit floats, extra whitespace, or the odd
+    ``;`` separator. Returns None unless exactly four numbers parse, and orders
+    the corners so ``(x1, y1)`` is top-left regardless of how they were written.
+    """
+    raw = el.get("data-bbox")
+    if not raw:
+        return None
+    try:
+        nums = [float(p) for p in raw.replace(";", ",").split(",") if p.strip()]
+    except ValueError:
+        return None
+    if len(nums) != 4:
+        return None
+    x1, y1, x2, y2 = (int(round(n)) for n in nums)
+    return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+
 def extract_cells(html: str) -> list[Cell]:
     """Lay cells onto a grid using the HTML table model.
 
@@ -92,6 +119,7 @@ def extract_cells(html: str) -> list[Cell]:
                     colspan=colspan,
                     tag=el.tag,
                     text=" ".join(el.text_content().split()),
+                    bbox=_parse_bbox(el),
                 )
             )
             col += colspan

@@ -35,26 +35,55 @@ two tracks differ only in drivers, data, hardware, and model size:
   Nothing leaves the network.
 
 ```
-src/data/    html_utils, difficulty scoring, FinTabNet loader, image prep (images.py)
-src/ocr/     stage-1 OCR words (engine.py) + geometric row/col grounding (layout.py)
-src/eval/    TEDS-Struct, span recovery, schema-inference metrics, bootstrap CIs, compare
+src/data/    html_utils, difficulty scoring, FinTabNet loader, image prep (images.py),
+             valuetypes.py (layout-independent value-kind classifier — shared by the
+             survey, verifier, and schema discovery)
+src/ocr/     engine.py (OcrWord + PaddleOCR adapter) + layout.py (geometric grounding
+             AND the survey: alignment-typed tracks, pitch, anchors, row typing,
+             contested list) + read.py (the reading pass — Qwen as its own OCR:
+             structure-blind guided fragments, tiling, cross-read consensus, unread-ink sweep)
+src/eval/    TEDS-Struct, span recovery, schema-inference metrics, bootstrap CIs, compare,
+             verify.py (layout-independent checks — geometry/type/schema-echo → repairable
+             problems; arithmetic/ink-in-blank/ocr_missed → soft flags)
 src/model/   registry.py (single source of truth for model roles), prompts
              (structure/full/schema), inference.py (transformers/unsloth/vLLM backends,
              thinking toggle), vllm_client.py (local served-endpoint client + guided
-             decoding), paddle_client.py + mineru_client.py (specialists),
-             docparse_utils.py (shared specialist output-parsing)
+             decoding), cells.py (JSON cell-list output: guided schema, validator,
+             repair suffix, cells_to_html — plus the fragment-id grounded path:
+             fill_cells_from_fragments, per-fragment identity, ocr_missed, vote_cells),
+             schema_infer.py (per-document schema discovery: dossier → Qwen candidates →
+             deterministic trial scoring → deferred commitment), paddle_client.py +
+             mineru_client.py (specialists), docparse_utils.py (shared parsing)
 src/train/   Unsloth LoRA — structure / schema / OCR-grounded / teacher-distillation
 src/demo/    side-by-side comparison renderer
 notebook/    Track-1 drivers (bakeoff/train/eval .py); Track-2 notebooks live at repo root
 tests/       run these before trusting any number
 ```
 
+The staged-reconstruction modules above (`valuetypes`, `read`, `verify`, `schema_infer`,
+the `layout` survey, the `cells` fragment path) implement `pipeline_design.md` — the
+Qwen-only logical-reconstruction architecture that supersedes the two-stage
+PaddleOCR/MinerU framing further down. Heavy work (the model calls in `read`/`schema_infer`,
+PIL in `verify`/`read`) is injected or deferred; the deterministic cores are unit-tested on
+the Mac. Specialists (`paddle_client`/`mineru_client`) are retained but de-scoped to future
+work (independent-witness OCR), not on the main path.
+
 ### Status: what has actually been run
 
 Verified end-to-end against live FinTabNet: corpus build (scan → rank → dedup → download →
 manifest → leakage check), TEDS-Struct, span recovery, the new schema-inference metrics,
-bootstrap CIs, and the comparison renderer. **All 18 `src/` modules import on the Mac with
+bootstrap CIs, and the comparison renderer. **All `src/` modules import on the Mac with
 no torch/vllm/paddle** — the deferred-import invariant holds.
+
+The `pipeline_design.md` modules land as pure-Python cores with the model/PIL calls
+injected or deferred, and are covered by Mac unit tests (`tests/test_valuetypes.py`,
+`test_read.py`, `test_verify.py`, `test_survey.py`, `test_schema_infer.py`, and the
+fragment-path additions in `test_cells.py`): value typing, tiling + cross-read consensus,
+the verifier families, the survey's track/row typing, and schema trial-scoring +
+deferred commitment (including the spec's 2- vs 3-child optional-column case). **Not yet
+run on a GPU:** the reading-pass and schema-discovery *model* calls, and the end-to-end
+staged loop — treat the first served run as a debugging session, and gate further staging
+on the B-vs-A ablation (`pipeline_design.md` §7-8).
 
 **Not verified — treat the first run as a debugging session:**
 - `inference.py` (transformers/unsloth/**vLLM** backends), `train/lora.py` — never executed
@@ -73,8 +102,8 @@ enumerate `public`/`both` models — never a `private` teacher.
 
 | Model (repo id) | Role | Track · hardware |
 |---|---|---|
-| **Qwen3.6-27B** dense `Qwen/Qwen3.6-27B` | **on-prem teacher** — vision + thinking; more potent than 35B-A3B for schema *reasoning* (27B active vs 3B), same family → clean distillation | private · L40 48 GB FP8 / vLLM |
-| `Qwen/Qwen3.6-35B-A3B` (MoE 35B/3B) | prior teacher, config swap-in | private · L40 |
+| **Qwen3.6-35B-A3B-FP8** `Qwen/Qwen3.6-35B-A3B-FP8` (MoE 35B/3B) | **on-prem teacher — the plan is pinned to this checkpoint** (user decision 2026-08-02); vision + thinking | private · L40 48 GB / vLLM |
+| `Qwen/Qwen3.6-27B` dense | alternate teacher, config swap-in | private · L40 FP8 |
 | `Qwen/Qwen3-VL-30B-A3B-Instruct` | public anchor / ceiling | public · Lightning 24 GB 4-bit |
 | **MinerU2.5-Pro** `opendatalab/MinerU2.5-Pro-2605-1.2B` | stage-1 OCR+geometry **+ best-open-Table-TEDS ceiling** (non-AGPL) | both · local 1.2 B |
 | **PaddleOCR-VL-1.6** `PaddlePaddle/PaddleOCR-VL-1.6` (0.9 B) | stage-1 OCR / overall-doc leader (96.33 OmniDocBench) | both · local |
@@ -96,6 +125,20 @@ reuses the OCR grounding already built:
   header schema as a prior (`prompts.build_schema_instruction`), make it infer the variable
   body schema (Optional column?), assign every OCR fragment to a logical cell, and keep
   blanks blank. Force valid HTML with vLLM guided decoding (`vllm_client` `guided_*`).
+
+Two capabilities added on top (2026-08-02):
+- **JSON cell-list output** (`src/model/cells.py`) — the recommended high-accuracy
+  path since output format is free: `guided_json` makes bbox+page *required* on
+  every cell (the "boxes vanish after the first call" failure becomes impossible),
+  blanks are grid holes the model cannot shift values into, `columns` must be
+  committed before any cell, and `validate_cells` + one repair round-trip machine-
+  check overlaps and invented/dropped values. `cells_to_html` feeds the unchanged
+  eval/demo stack. A/B this against the HTML+`data-bbox` path before picking the
+  distillation target.
+- **Multi-page tables** — `predict` (both backends) takes a list of page crops for
+  one long table; the prompt gains a stitching note (continuation header once, the
+  row cut at the page break merged, `data-page`/`p` on every position) and
+  `ocr_layout` becomes per-page. Serve with `--limit-mm-per-prompt image=4`.
 
 ### Three constraints that are easy to break by accident
 

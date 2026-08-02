@@ -23,8 +23,9 @@ from dataclasses import dataclass
 
 # --- reasoning VLMs (generative; run via inference.TableReconstructor or a local
 #     vLLM endpoint through vllm_client) ------------------------------------------
-MODEL_QWEN36_27B = "Qwen/Qwen3.6-27B"  # on-prem teacher: dense, vision, thinking
-MODEL_QWEN36_35B = "Qwen/Qwen3.6-35B-A3B"  # prior teacher (MoE 35B/3B-active), swap-in
+MODEL_QWEN36_35B_FP8 = "Qwen/Qwen3.6-35B-A3B-FP8"  # on-prem teacher (current plan)
+MODEL_QWEN36_35B = "Qwen/Qwen3.6-35B-A3B"  # same MoE, unquantized weights
+MODEL_QWEN36_27B = "Qwen/Qwen3.6-27B"  # alternate teacher: dense, vision, thinking
 MODEL_QWEN3VL_30B = "Qwen/Qwen3-VL-30B-A3B-Instruct"  # public anchor / ceiling
 MODEL_8B = "Qwen/Qwen3-VL-8B-Instruct"  # student / fallback anchor
 MODEL_4B = "Qwen/Qwen3-VL-4B-Instruct"  # small trainable (Lightning ~2 h LoRA)
@@ -51,13 +52,17 @@ class ModelSpec:
 
 # The one registry. Keys are the short names drivers and notebooks iterate over.
 MODELS: dict[str, ModelSpec] = {
-    "qwen3.6-27b": ModelSpec(
-        MODEL_QWEN36_27B, "on-prem teacher (stronger)", "private",
-        "L40 48GB FP8 / vLLM", "generative", True,
+    "qwen3.6-35b-a3b-fp8": ModelSpec(
+        MODEL_QWEN36_35B_FP8, "on-prem teacher (current plan)", "private",
+        "L40 48GB / vLLM FP8", "generative", False,
     ),
     "qwen3.6-35b-a3b": ModelSpec(
-        MODEL_QWEN36_35B, "prior teacher (swap-in)", "private",
-        "L40 48GB FP8 / vLLM", "generative", False,
+        MODEL_QWEN36_35B, "teacher, unquantized swap-in", "private",
+        "needs >48GB or on-the-fly quant", "generative", False,
+    ),
+    "qwen3.6-27b": ModelSpec(
+        MODEL_QWEN36_27B, "alternate teacher (dense)", "private",
+        "L40 48GB FP8 / vLLM", "generative", True,
     ),
     "qwen3-vl-30b-a3b": ModelSpec(
         MODEL_QWEN3VL_30B, "public anchor / ceiling", "public",

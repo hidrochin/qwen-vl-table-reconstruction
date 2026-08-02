@@ -35,8 +35,9 @@ from src.model.registry import (  # noqa: F401
     MODEL_QWEN3VL_30B,
     MODEL_QWEN36_27B,
     MODEL_QWEN36_35B,
+    MODEL_QWEN36_35B_FP8,
 )
-from src.model.prompts import INSTRUCTIONS, build_messages, clean_prediction
+from src.model.prompts import INSTRUCTIONS, as_image_list, build_messages, clean_prediction
 
 # 1024 visual tokens. Each token covers a 28x28 patch with 2x2 merging.
 DEFAULT_MAX_PIXELS = 1024 * 28 * 28
@@ -164,7 +165,8 @@ class TableReconstructor:
         )
         self._vllm = LLM(
             model=self.model_id,
-            limit_mm_per_prompt={"image": 1},
+            # >1 so a long table split across page crops fits in one prompt.
+            limit_mm_per_prompt={"image": 4},
             trust_remote_code=True,
         )
 
@@ -188,13 +190,15 @@ class TableReconstructor:
 
     def predict(
         self,
-        image_path: str | Path,
+        image_path: str | Path | list[str | Path],
         mode: str = "structure",
         max_new_tokens: int = 2048,
         instruction: str | None = None,
-        ocr_layout: str | None = None,
+        ocr_layout: str | list[str] | None = None,
     ) -> Prediction:
-        """Generate HTML for one table image.
+        """Generate HTML for one table -- one image, or a page list for a long
+        table split across several crops (reading order; ``build_messages`` adds
+        the multi-page stitching note automatically).
 
         ``mode`` is ``structure`` | ``full`` | ``schema`` (the logical-
         reconstruction prompt). ``instruction`` overrides the mode's default --
@@ -202,32 +206,33 @@ class TableReconstructor:
         ``prompts.py`` mid-session has no effect once the module is imported.
 
         ``ocr_layout`` is the serialized OCR text+positions from
-        ``src.ocr.layout.serialize_layout`` (stage 1). Provide it with the
-        grounded or schema instruction so the model structures known text instead
-        of re-reading pixels.
+        ``src.ocr.layout.serialize_layout`` (stage 1); a list means one layout
+        per page. Provide it with the grounded or schema instruction so the
+        model structures known text instead of re-reading pixels.
         """
         from PIL import Image
 
         if instruction is None and mode not in INSTRUCTIONS:
             raise ValueError(f"mode must be one of {sorted(INSTRUCTIONS)}")
 
-        image = Image.open(image_path).convert("RGB")
-        messages = build_messages(image, mode, instruction, ocr_layout)
+        paths = as_image_list(image_path)
+        images = [Image.open(p).convert("RGB") for p in paths]
+        messages = build_messages(images, mode, instruction, ocr_layout)
         text = self._apply_template(messages)
 
         if self.backend == "vllm":
-            raw = self._generate_vllm(text, image, max_new_tokens)
+            raw = self._generate_vllm(text, images, max_new_tokens)
         else:
-            raw = self._generate_hf(text, image, max_new_tokens)
+            raw = self._generate_hf(text, images, max_new_tokens)
 
         raw = strip_thinking(raw)
-        return Prediction(uid=Path(image_path).stem, raw=raw, html=clean_prediction(raw))
+        return Prediction(uid=Path(paths[0]).stem, raw=raw, html=clean_prediction(raw))
 
-    def _generate_hf(self, text: str, image, max_new_tokens: int) -> str:
+    def _generate_hf(self, text: str, images: list, max_new_tokens: int) -> str:
         import torch
 
         inputs = self._processor(
-            text=[text], images=[image], return_tensors="pt", padding=True
+            text=[text], images=[images], return_tensors="pt", padding=True
         ).to(self._model.device)
         with torch.inference_mode():
             generated = self._model.generate(
@@ -238,12 +243,14 @@ class TableReconstructor:
         trimmed = generated[0][inputs["input_ids"].shape[1] :]
         return self._processor.decode(trimmed, skip_special_tokens=True)
 
-    def _generate_vllm(self, text: str, image, max_new_tokens: int) -> str:
+    def _generate_vllm(self, text: str, images: list, max_new_tokens: int) -> str:
         from vllm import SamplingParams
 
         params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+        # vLLM takes a bare image for one page, a list for several.
+        mm = images[0] if len(images) == 1 else images
         outputs = self._vllm.generate(
-            {"prompt": text, "multi_modal_data": {"image": image}},
+            {"prompt": text, "multi_modal_data": {"image": mm}},
             params,
         )
         return outputs[0].outputs[0].text
