@@ -1,743 +1,482 @@
-# Lộ trình cải thiện KIE: LayoutXLM + SPADE/BROS decoder
+# v4 — Sau khi xác nhận shortcut: hai hướng và cách kết hợp
 
-**v3** — viết lại sau khi Sprint 0 và Sprint 1 được kiểm chứng thực nghiệm và **bị bác bỏ**, cùng với hai phát hiện mới có giá trị chẩn đoán cao.
+**Bối cảnh mới:** shortcut đã được xác nhận. Thuật toán sắp xếp trước model đôi khi trả về thứ tự sai; khi đó model bám vào shortcut và sinh zigzag. **Sửa tay thứ tự OCR → model trả kết quả hoàn hảo.**
 
-> Pipeline: **LayoutXLM backbone → 3 head (ITC / STC / EL)**, loss = tổng 3 CE không trọng số, sliding window không overlap, ~5% dữ liệu chữ viết tay. OCR đã qua deskew/dewarp.
+Kết luận quan trọng nhất từ dữ kiện này: **model của bạn không bị hỏng.** Biểu diễn LayoutXLM + 3 head đã đủ tốt để giải bài toán khi đầu vào đúng. Bạn không cần đổi kiến trúc, không cần GOSE, không cần PEneo. Bạn có một bài toán **reading order**, và một bài toán **độ bền trước lỗi reading order**. Đó là hai hướng bạn nêu, và chúng bổ trợ chứ không thay thế nhau.
 
 ---
 
-## 0. Trạng thái các giả thuyết cũ
+## 0. Định vị lại bài toán trước khi chọn thuật toán
 
-| Giả thuyết (v1/v2) | Kết quả | Trạng thái |
+Thuật toán sắp xếp có ba tầng, và chúng hỏng theo những cách rất khác nhau:
+
+| Tầng | Việc | Mức độ khó với form của bạn |
 |---|---|---|
-| `parse_subsequent_words` vứt token khi xung đột (§1.1 v2) | Đã đo, không có xung đột đáng kể | ❌ Bác bỏ |
-| Điều kiện dừng chuỗi chỉ chặn init token cùng class (§1.2 v2) | Code đã xử lý chặt chẽ | ❌ Bác bỏ |
-| `dummy_idx` lệch sau khi nối window (§1.3 v2) | Verify, không lệch | ❌ Bác bỏ |
-| Hungarian decoding cho STC | Đã thử, không cải thiện | ❌ Bác bỏ |
-| Mask hình học khi decode | Đã thử, không cải thiện | ❌ Bác bỏ |
-| Sliding window là nguồn lỗi lớn | Thiệt hại tại biên chỉ ~2% | 🟡 Hạ ưu tiên |
-| Bbox augmentation cho chữ tay (§5.2 v2) | Đã train lại, không giải quyết vấn đề | ❌ Không đủ |
-| **Band STC theo offset reading-order** (đề xuất giữa chừng) | — | ❌ **Tôi rút lại — xem §2.4** |
+| **T1. Gom từ thành dòng** | word nào thuộc cùng một dòng vật lý | 🔴 **Đây là chỗ hỏng** |
+| T2. Sắp thứ tự các dòng | dòng nào trước dòng nào | 🟢 Dễ — form là layout Manhattan, sắp theo y là đủ |
+| T3. Sắp thứ tự trong dòng | từ nào trước từ nào trong cùng dòng | 🟢 Dễ — sắp theo x |
 
-Việc cả năm giả thuyết về decoding đều sai **là một kết quả có giá trị**: nó loại trừ toàn bộ tầng decode ra khỏi phạm vi nghi vấn. Vấn đề nằm ở tầng **biểu diễn và huấn luyện**, không phải tầng suy luận.
+Chuỗi lỗi `tháng sáu năm 08 hai 06 nghìn` là bằng chứng T1 hỏng: hai dòng vật lý bị gộp thành một, rồi T3 sắp lại theo x và trộn chúng vào nhau. T2 và T3 hoàn toàn vô tội.
 
----
+**Hệ quả thực tiễn: bạn không cần XY-cut, không cần LayoutReader, không cần thuật toán "cực kỳ tuyệt vời" cho toàn trang.** XY-cut đạt 100% trên layout Manhattan — form của bạn thuộc loại đó. Vấn đề của bạn nằm ở tầng dưới nó: gom từ thành dòng khi bbox chữ tay chồng lấn dọc.
 
-## 1. 🔴 Chẩn đoán mới: model đang học shortcut theo thứ tự OCR
-
-### 1.1 Bằng chứng
-
-Ba quan sát của bạn, khi ghép lại, chỉ tương thích với đúng một giải thích:
-
-1. **Chuỗi zigzag bám sát thứ tự OCR.** Với `ocr.txt` dạng `ngày / tháng / năm / sinh / tháng / sáu / năm / 08 / hai / 06 / nghìn / ...`, output của model gần như là chính chuỗi này đọc tuần tự.
-2. **Softmax gần như phẳng** tại các link sai — không phải "phân vân giữa hai ứng viên hợp lý" mà là "không có tri thức nào về câu hỏi này".
-3. **Hai mẫu chữ tay gần giống nhau, một đúng một sai.** Không giải thích được bằng nội dung value, nhưng giải thích được hoàn hảo bằng **OCR có đan xen dòng hay không**.
-
-Kết luận: STC head không học "token nào là successor về mặt ngữ nghĩa và hình học". Nó học **`successor = token kế tiếp trong file OCR`**.
-
-### 1.2 Vì sao đây là nghiệm tối ưu của bài toán bạn đang đặt ra
-
-Với chữ in, OCR trả về thứ tự sạch. Heuristic "offset +1" đúng gần 100%. Model đạt 95% F1 **mà chưa bao giờ phải học điều gì thực sự** về layout. Gradient không có lý do nào để đẩy model đi xa hơn — shortcut đã đủ để tối thiểu hoá loss.
-
-Khi OCR đan xen hai dòng (chữ tay, dấu tiếng Việt làm bbox chồng lấn dọc, line grouping của OCR engine gộp nhầm), heuristic gãy. Và model **không có gì để rơi về**, vì cơ chế thay thế chưa từng được học. Softmax phẳng chính là chữ ký của khoảng trống đó.
-
-Điều này cũng giải thích vì sao Sprint 1 vô hiệu: **decoder không thể sửa được thứ nó không nhận được**. Khi score matrix gần đều, mọi thuật toán gán tối ưu — Hungarian, beam search, mask hình học — đều chỉ đang tối ưu hoá nhiễu.
-
-### 1.3 Vì sao augmentation bbox ở Sprint 2 không giúp
-
-Bbox jitter thay đổi toạ độ nhưng **không thay đổi thứ tự token**. Shortcut nằm ở thứ tự, nên augmentation không bao giờ chạm tới nó. Bạn đã tăng độ bền cho một tín hiệu mà model không dùng.
-
-### 1.4 ⚠️ Điểm cần làm rõ trước khi đi tiếp: "GT đúng thứ tự" nghĩa là gì?
-
-Đây là câu hỏi quan trọng nhất trong tài liệu này, vì hai câu trả lời dẫn đến hai lộ trình khác nhau hoàn toàn.
-
-Bạn nói GT được đảm bảo "đi đúng thứ tự". Có hai cách hiểu:
-
-**(a) GT đơn điệu tăng theo index OCR.** Khi đó chuỗi GT của entity ngày sinh chính là `tháng → sáu → năm → 08 → hai → 06 → nghìn → ...` — tức là **GT cũng zigzag**, và model bám theo thứ tự OCR đang... trả lời đúng. Điều này mâu thuẫn với việc bạn quan sát thấy lỗi. Nếu đây là trường hợp thực tế thì vấn đề không phải model mà là **chính nhãn đang mã hoá một thứ tự vô nghĩa**, và không mô hình nào học được từ đó.
-
-**(b) GT theo thứ tự đọc ngữ nghĩa** (`08 → 06 → 2011 → ngày → mùng → tám → tháng → sáu → ...`). Khi đó GT **không đơn điệu** theo index OCR, model buộc phải học nhảy ngược — đúng thứ nó chưa bao giờ được dạy vì 95% dữ liệu chữ in không có tình huống này. Đây là giả thuyết tôi cho là đúng.
-
-**Cách kiểm tra (5 phút, chạy trên server công ty):**
-
-```python
-def chain_monotonic(chain):
-    return all(chain[i] < chain[i+1] for i in range(len(chain)-1))
-
-rate = np.mean([chain_monotonic(c) for c in gt_chains])
-print(rate)   # tách printed / handwritten
-```
-
-- Chữ in ≈ 100%, chữ tay ≈ 100% → **trường hợp (a)**, nhãn đang bị nhiễm thứ tự OCR sai. Phải sửa line grouping ở khâu OCR trước, mọi thứ khác là vô nghĩa.
-- Chữ in ≈ 100%, chữ tay thấp hơn rõ rệt → **trường hợp (b)**, xác nhận chẩn đoán §1.1 và toàn bộ tài liệu này áp dụng được.
-
-Tương ứng, đo phân bố offset:
-
-```python
-offsets = [c[k+1]-c[k] for c in gt_chains for k in range(len(c)-1)]
-print(sum(o == 1 for o in offsets) / len(offsets))   # tỉ lệ link "+1"
-```
-
-Nếu ≥ 0.93 thì shortcut là nghiệm tối ưu — con số này định lượng chính xác mức độ hấp dẫn của đường tắt mà bạn cần phá.
+Kiểm tra 30 phút để xác nhận: lấy các mẫu bị lỗi, so sánh line grouping của thuật toán hiện tại với line grouping đúng (gán tay). Nếu 100% lỗi nằm ở T1, bạn tiết kiệm được rất nhiều công sức đi nhầm hướng.
 
 ---
 
-## 2. Sprint 0′ — Chẩn đoán mới (nửa ngày, không train)
+## Phần A — Hướng 1: thuật toán sắp xếp chỉ từ bbox
 
-Toàn bộ chạy được nội bộ, không cần chia sẻ dữ liệu ra ngoài.
+### A.1 🔴 Vì sao chữ tay tiếng Việt phá vỡ line grouping
 
-### 2.1 🔴 Permutation test — thí nghiệm quyết định
+Đây là nguyên nhân gốc và nó rất cụ thể:
 
-Lấy một mẫu **chữ in** mà model đang nối đúng 100%. Giữ nguyên bbox, giữ nguyên nhãn, chỉ **hoán vị thứ tự token** để mô phỏng đúng kiểu đan xen của OCR:
+```
+Dòng 1:  "ngày mùng tám"     bbox_height = 30px  (có chữ "g" thòng xuống + dấu huyền)
+Dòng 2:  "tháng sáu"          bbox_height = 34px  (có "ố", "á" nhô lên + "g" thòng xuống)
+```
+
+Tiếng Việt có **hai tầng dấu**: dấu mũ/móc (ê, ô, ơ, ư, ă, â) cộng dấu thanh (sắc huyền hỏi ngã nặng) chồng lên trên, cộng dấu nặng chấm bên dưới. Một từ như `ưỡn` hay `ệ` có bbox cao gần **gấp đôi** thân chữ. Với chữ in, chiều cao dòng cố định nên vẫn không chồng nhau. Với chữ tay, người viết không giữ khoảng cách dòng đều → bbox dòng 1 và dòng 2 **chồng lấn dọc** → mọi thuật toán clustering theo y-center hoặc y-overlap đều gộp chúng.
+
+Đây là lý do chỉ chữ tay tiếng Việt bị, và chỉ ở một số mẫu (phụ thuộc người viết).
+
+### A.2 🔴 Ràng buộc quyết định: **hai từ cùng dòng không được chồng lấn theo x**
+
+Đây là ràng buộc mạnh nhất bạn có, và chữ tay **không phá vỡ** nó. Con người không viết đè hai từ lên nhau theo chiều ngang trong cùng một dòng.
 
 ```python
-def interleave_two_lines(order, boxes, line_id, lid_a, lid_b):
-    """Gộp token của 2 dòng liền kề rồi sắp lại theo xmin — tái tạo lỗi OCR."""
-    idx = [i for i in order if line_id[i] in (lid_a, lid_b)]
-    idx_sorted = sorted(idx, key=lambda i: boxes[i][0])
-    out, it = [], iter(idx_sorted)
-    for i in order:
-        out.append(next(it) if line_id[i] in (lid_a, lid_b) else i)
-    return out
+def x_overlap_ratio(bi, bj):
+    ov = min(bi[2], bj[2]) - max(bi[0], bj[0])
+    return ov / max(1e-6, min(bi[2]-bi[0], bj[2]-bj[0]))
+
+# nếu x_overlap_ratio > 0.3  →  CHẮC CHẮN khác dòng, bất kể y thế nào
 ```
 
-Chạy inference lại với thứ tự mới (hoán vị **cả** `input_ids`, `bbox`, và các nhãn tương ứng để chấm điểm).
+Ràng buộc này một mình đã đủ để tách hai dòng bị gộp trong ví dụ giấy khai sinh: `08`(x≈255) và `hai`(x≈255) chồng nhau hoàn toàn theo x, nên không thể cùng dòng. Thuật toán hiện tại của bạn nhiều khả năng đang thiếu đúng ràng buộc này.
 
-| Kết quả | Diễn giải |
-|---|---|
-| Model vẫn nối đúng | Shortcut không tồn tại → chẩn đoán §1 sai, dừng lại và xem §7 |
-| Model gãy y hệt giấy khai sinh | ✅ **Xác nhận** — và bạn vừa có cách sinh vô hạn test case từ 95% dữ liệu chữ in |
+### A.3 🔴 Ước lượng thân chữ thay vì bbox height
 
-### 2.2 🔴 Ablation `position_ids`
+Thay vì dùng `y1 - y0`, ước lượng vùng **thân chữ** (x-height band) — nơi phần lớn nét nằm, loại bỏ dấu và phần thòng:
 
 ```python
-# đóng băng model, đặt position_ids = hằng số (hoặc hoán vị ngẫu nhiên)
-outputs = model(input_ids=ids, bbox=bbox, position_ids=torch.full_like(ids, 2), ...)
+def body_band(boxes_in_line):
+    """Ước lượng dải thân chữ của một dòng bằng percentile, chịu được dấu tiếng Việt."""
+    tops    = np.array([b[1] for b in boxes_in_line])
+    bottoms = np.array([b[3] for b in boxes_in_line])
+    # baseline ổn định hơn đỉnh: dùng percentile thấp của bottom
+    base = np.percentile(bottoms, 40)
+    # x-height: dùng percentile cao của top thay vì min
+    top  = np.percentile(tops, 60)
+    return top, base
 ```
 
-Đo lại F1 trên tập chữ in. F1 sụp đổ → model dựa chủ yếu vào 1D positional embedding chứ không phải layout. Đây là phép đo **trực tiếp** mức độ phụ thuộc shortcut, và nó mâu thuẫn với tinh thần thiết kế của SPADE/BROS (vốn được cho là bất biến thứ tự).
+Nguyên tắc: **baseline (đáy thân chữ) là tín hiệu ổn định nhất của một dòng.** Đỉnh bbox bị dấu làm nhiễu mạnh, đáy bbox bị phần thòng (g, y, p, ạ, ợ) làm nhiễu nhẹ hơn. Ước lượng theo percentile chịu được cả hai.
 
-> Lưu ý kỹ thuật: LayoutXLM kế thừa quy ước RoBERTa, `position_ids` bắt đầu từ `pad_token_id + 1 = 2`, không phải 0. Xem §3.1.
+Với box đơn lẻ chưa biết thuộc dòng nào, dùng thống kê toàn trang: `h_median` của tất cả box, rồi coi box nào cao hơn `1.4 × h_median` là "có dấu" và co lại về `h_median` khi tính y-overlap.
 
-### 2.3 🟠 Phân tích **link sai đầu tiên**
+### A.4 🟠 Docstrum: ước lượng skew **cục bộ**, bất biến với ảnh nghiêng/cong
 
-Bạn nói không tìm thấy điểm chung giữa các trường hợp zigzag. Đây gần như chắc chắn là artifact của cách đo: khi link thứ *k* sai, chuỗi đã lạc sang vùng token khác nên mọi link từ *k+1* trở đi là **rác thứ cấp**. Bạn đang so sánh các chuỗi rác với nhau.
+Đây là câu trả lời kinh điển cho yêu cầu "chịu được ảnh nghiêng nhẹ hoặc cong nhẹ", và nó có từ 1993 (O'Gorman, *The Document Spectrum*). Ưu điểm được chính tác giả nêu: độc lập với góc nghiêng, độc lập với khoảng cách chữ, và xử lý được các vùng có hướng khác nhau trong cùng một ảnh.
+
+Cơ chế:
+
+1. Với mỗi box, tìm `k` láng giềng gần nhất (k = 4–6) theo khoảng cách tâm
+2. Tính histogram **góc** của các cặp láng giềng → đỉnh histogram là hướng dòng
+3. Cặp "cùng dòng" = cặp có góc gần hướng dòng (±15°)
+4. Đóng bao truyền ứng (transitive closure) các cặp cùng dòng → dòng
+
+Điểm mấu chốt cho ảnh cong: **tính hướng dòng cục bộ cho từng box** từ chính k láng giềng của nó, thay vì một góc skew toàn cục. Ảnh cong thì hướng dòng biến thiên chậm theo vị trí, và ước lượng cục bộ bám theo được.
 
 ```python
-def first_break(gt_chain, next_map):
-    for k in range(len(gt_chain) - 1):
-        i, j_true = gt_chain[k], gt_chain[k+1]
-        j_pred = next_map.get(i, None)
-        if j_pred != j_true:
-            return dict(k=k, i=i, j_true=j_true, j_pred=j_pred,
-                        offset_true=j_true - i, offset_pred=(j_pred - i) if j_pred else None,
-                        cross_line=line_id[i] != line_id[j_true])
-    return None
+def local_orientation(boxes, i, k=5):
+    """Hướng dòng cục bộ tại box i, từ k láng giềng gần nhất."""
+    c = centers(boxes)
+    d = np.linalg.norm(c - c[i], axis=1)
+    nb = np.argsort(d)[1:k+1]
+    angles = np.arctan2(c[nb, 1] - c[i, 1], c[nb, 0] - c[i, 0])
+    angles = np.where(angles > np.pi/2, angles - np.pi, angles)
+    angles = np.where(angles < -np.pi/2, angles + np.pi, angles)
+    # lọc bỏ các cặp gần vuông góc (láng giềng dòng trên/dưới)
+    horiz = angles[np.abs(angles) < np.radians(40)]
+    return np.median(horiz) if len(horiz) else 0.0
 ```
 
-Thống kê trên toàn bộ lỗi: tỉ lệ `cross_line`, histogram `offset_true`, histogram `offset_pred`. Dự đoán: **`offset_pred` tập trung áp đảo ở +1**, còn `offset_true` phân tán. Đó chính là chữ ký shortcut, và cũng chính là "hành vi nhất quán" bạn cần để hậu xử lý.
+⚠️ Lưu ý thực tế: Docstrum được thiết kế cho **connected components**, còn bạn có **word boxes** từ OCR. Điều này thực ra thuận lợi hơn — ít nhiễu hơn, ít box hơn. Nhưng `k` cần nhỏ hơn (4–6 thay vì 4–5 cho CC) và cần lọc góc cẩn thận vì word box thưa hơn CC.
 
-### 2.4 ❌ Đính chính: đề xuất band theo offset là sai
+⚠️ Docstrum thuần **không đủ** cho chữ tay: literature nhất quán chỉ ra Docstrum và các phương pháp k-NN CC grouping thất bại trên tài liệu viết tay vì dòng nghiêng không đều, cong, và khoảng cách dòng không rõ hơn khoảng cách chữ. Nên phải kết hợp với A.2 (ràng buộc x-overlap) và A.5 (tối ưu toàn cục).
 
-Ở lượt trao đổi trước tôi đề nghị chặn `stc_logits` ngoài khoảng `0 < j - i ≤ K`. Với dữ liệu của bạn điều đó **có hại trực tiếp**: chính những link cần sửa lại là những link có offset lớn hoặc âm. Band sẽ khoá cứng luôn cái shortcut bạn đang muốn phá. Bỏ hẳn.
+### A.5 🔴 Công thức đúng: **degree-constrained path cover với max-regret**
 
-(Mục §4.2 "banded head" của v2 cũng bị xoá vì cùng lý do.)
+Đây là phần đáng giá nhất trong tài liệu này. Thay vì clustering rồi sắp xếp, hãy đặt cả T1 và T3 thành **một bài toán duy nhất**: tìm tập cạnh "successor" tối đa hoá tổng điểm, với ràng buộc mỗi node ≤1 successor và ≤1 predecessor, không chu trình.
 
-### 2.5 🟠 Tỉ lệ zigzag theo từng trường
+Đây chính là formulation trong một bài 2026 về reading order cho layout phức tạp (arXiv:2607.01018): mỗi dòng OCR là một node trong đồ thị có hướng, và thứ tự đọc được khôi phục dưới dạng degree-constrained directed path cover. Áp dụng cho bạn ở mức **word** thay vì mức line — và điều đó hợp lý vì bài toán của bạn nằm ở tầng gom từ.
 
-Trường `Ngày tháng năm sinh` có một đặc điểm không trường nào khác có: **value chứa cùng thông tin hai lần**, một lần bằng số một lần bằng chữ (`08`↔`tám`, `06`↔`sáu`, `2011`↔`hai nghìn không trăm mười một`). Head bilinear tính score từ hidden state; hai token mang nội dung ngữ nghĩa gần trùng nhau sẽ có key vector gần nhau → score gần nhau → argmax lung lay.
+**Phát hiện quan trọng nhất của bài đó: cách chọn cạnh quan trọng hơn cách chấm điểm cạnh.**
 
-Nếu tỉ lệ zigzag của trường này cao vượt trội so với các trường viết tay dài khác (`Nơi thường trú`, `Nơi đăng ký` — cũng dài, cũng xuống dòng), thì đây là **nguyên nhân thứ hai chồng lên shortcut**, và cách chữa là geometric bias (§5.1) chứ không phải augmentation.
+Greedy (chọn cạnh điểm cao nhất trước) mắc lỗi *edge theft*: một cạnh sai sớm chiếm mất in-degree của một node, khiến predecessor đúng không còn chỗ, gây lỗi dây chuyền. Trên benchmark của họ, greedy chỉ đạt 56.0% trong khi max-regret đạt 93.0% — **chênh 37 điểm với cùng bộ score**. Số lỗi cross-stream giảm từ 27.8 xuống 4.4, same-stream từ 85.6 xuống 9.2.
 
-### 2.6 🟠 Còn giữ lại từ v2
-
-| # | Việc | Ghi chú |
-|---|---|---|
-| a | F1 bất biến thứ tự (frozenset thay vì tuple) | Tách "sai gom nhóm" khỏi "sai thứ tự" — vẫn rất đáng đo |
-| b | Pair-level F1 end-to-end (entity dự đoán, không oracle) | Metric north-star |
-| c | Tách metric printed / handwritten | Bắt buộc từ giờ trở đi |
-| d | Train 3 seed, tính std | Quyết định ngưỡng ý nghĩa. Rẻ nhất trong bảng |
-| e | EL: loss tính trên first-token GT nhưng infer dùng first-token dự đoán? | Mismatch train/infer, xem §5.2 |
-
----
-
-## 3. Giải thích: 1D positional embedding trong LayoutXLM
-
-Bạn hỏi đúng chỗ. Config bạn gửi có **ba nhóm** cơ chế vị trí khác nhau, và tôi đã nói không đủ rõ ở lượt trước.
-
-### 3.1 Nhóm 1 — Absolute 1D position embedding ← **đây là thứ tôi muốn nói**
-
-```json
-"max_position_embeddings": 514
-```
-
-Đây là bảng embedding `embeddings.position_embeddings` — một `nn.Embedding(514, 768)`, kế thừa từ XLM-R. Nó mã hoá **token này là token thứ mấy trong chuỗi**, tức là **chính xác thứ tự OCR**.
-
-- Có pretrained weight đầy đủ ✅
-- `514 = 512 + 2` vì quy ước RoBERTa: `position_ids` bắt đầu từ `padding_idx + 1 = 2`
-- Đây là kênh mà shortcut §1 đi qua
-
-Trong `forward`, nếu bạn không truyền `position_ids`, HF sẽ tự sinh `arange` từ `input_ids`. Bạn **có thể** truyền vào:
+Max-regret: ưu tiên quyết định có **chi phí cơ hội cao nhất**.
 
 ```python
-# vô hiệu hoá hoàn toàn
-position_ids = torch.full_like(input_ids, 2)
+def max_regret_path_cover(cand_edges, score, N):
+    """
+    cand_edges: dict {u: [v1, v2, ...]}  ứng viên successor của u
+    score: score[(u,v)] -> float
+    Trả về: {u: v} — path cover không chu trình
+    """
+    E, out_used, in_used = {}, set(), set()
+    succ = {}                      # để kiểm tra chu trình bằng truy vết
 
-# hoặc hoán vị (mềm hơn, khuyến nghị)
-perm = torch.randperm(seq_len, device=ids.device) + 2
-position_ids = perm.unsqueeze(0).expand_as(input_ids)
-```
+    def creates_cycle(u, v):
+        x = v
+        for _ in range(N):
+            if x == u: return True
+            if x not in succ: return False
+            x = succ[x]
+        return True
 
-⚠️ Vô hiệu hoá **hoàn toàn** rất rủi ro: 1D-PE đan xen chặt với backbone văn bản XLM-R đã pretrain. Bỏ nó đi khiến biểu diễn ngôn ngữ suy giảm mạnh, và bạn sẽ mất nhiều hơn được. **Dùng biến thể hoán vị theo tỉ lệ sample** (§4.2) thay vì tắt cứng.
+    def feasible(u, v):
+        return (u not in out_used and v not in in_used
+                and u != v and not creates_cycle(u, v))
 
-### 3.2 Nhóm 2 — 2D layout embedding (đang hoạt động)
-
-```json
-"max_2d_position_embeddings": 1024,
-"coordinate_size": 128,
-"shape_size": 128
-```
-
-Mã hoá `x0, y0, x1, y1, w, h` đã chuẩn hoá về thang 0–1000. Có pretrained weight, đang chạy bình thường. **Không đụng vào.** Ngược lại, đây là kênh bạn muốn model dựa vào nhiều hơn.
-
-### 3.3 Nhóm 3 — Relative attention bias ← **thứ bạn hỏi, và bạn đoán đúng**
-
-```json
-"has_relative_attention_bias": false,
-"has_spatial_attention_bias": false,
-"rel_pos_bins": 32,      "max_rel_pos": 128,
-"rel_2d_pos_bins": 64,   "max_rel_2d_pos": 256
-```
-
-Đây là cơ chế của LayoutLMv2: cộng thêm bias vào attention logits dựa trên **khoảng cách tương đối** giữa hai token — `rel_pos` theo index chuỗi, `rel_2d_pos` theo toạ độ x/y.
-
-Bạn nhận xét chính xác: **hai cờ này `false` trong checkpoint LayoutXLM, nên không có pretrained weight cho `rel_pos_bias` và `rel_pos_x_bias`/`rel_pos_y_bias`.** Bốn tham số `rel_pos_bins`, `max_rel_pos`, `rel_2d_pos_bins`, `max_rel_2d_pos` đang nằm im, không có tác dụng gì.
-
-**Đây không phải thứ tôi định nói ở lượt trước** — tôi nói về nhóm 1. Nhưng nhóm 3 hoá ra là một **cơ hội độc lập đáng giá**, xem §5.3.
-
-### 3.4 Bảng tổng kết
-
-| Cơ chế | Config | Pretrained? | Vai trò trong vấn đề của bạn | Hành động |
-|---|---|---|---|---|
-| Absolute 1D PE | `max_position_embeddings: 514` | ✅ Có | 🔴 **Kênh của shortcut** | Hoán vị theo tỉ lệ (§4.2) |
-| 2D layout embedding | `max_2d_position_embeddings: 1024` | ✅ Có | Kênh bạn muốn tăng cường | Giữ nguyên |
-| Relative 1D bias | `has_relative_attention_bias: false` | ❌ Không | Đang tắt | Để tắt |
-| Relative 2D spatial bias | `has_spatial_attention_bias: false` | ❌ Không | Đang tắt — **lãng phí** | Cân nhắc bật, train from scratch (§5.3) |
-
----
-
-## 4. Sprint A — Phá shortcut (ưu tiên tuyệt đối)
-
-Ba việc dưới đây cùng một mục tiêu: làm cho "offset +1" **không còn là tín hiệu dự đoán được**, buộc model phải học hình học và ngữ nghĩa.
-
-### 4.1 🔴 Augmentation đan xen dòng — mô phỏng đúng lỗi OCR
-
-Không shuffle ngẫu nhiên. Shuffle ngẫu nhiên tạo ra phân bố mà production không bao giờ gặp, và model sẽ học cách bỏ qua thứ tự **quá mức**, mất luôn tín hiệu hữu ích khi OCR đúng. Mô phỏng đúng cơ chế gây lỗi:
-
-```python
-def augment_ocr_interleave(order, boxes, line_id, labels, p=0.35, max_pairs=2):
-    """Mô phỏng lỗi gộp dòng của OCR engine: chọn 1-2 cặp dòng liền kề,
-    gộp token rồi sắp lại theo xmin. Áp lên dữ liệu CHỮ IN."""
-    if random.random() > p:
-        return order, labels
-    lids = sorted(set(line_id))
-    new_order = list(order)
-    for _ in range(random.randint(1, max_pairs)):
-        if len(lids) < 2:
+    while True:
+        best_u, best_regret, best_list = None, -1, None
+        for u in cand_edges:
+            if u in out_used: continue
+            C = sorted((v for v in cand_edges[u] if feasible(u, v)),
+                       key=lambda v: -score[(u, v)])
+            if not C: continue
+            r = (score[(u, C[0])] - score[(u, C[1])]) if len(C) > 1 else 0.0
+            if r > best_regret or (r == best_regret and best_u is not None
+                                   and score[(u, C[0])] > score[(best_u, best_list[0])]):
+                best_u, best_regret, best_list = u, r, C
+        if best_u is None:
             break
-        a = random.randrange(len(lids) - 1)
-        la, lb = lids[a], lids[a + 1]
-        pos = [k for k, i in enumerate(new_order) if line_id[i] in (la, lb)]
-        toks = sorted((new_order[k] for k in pos), key=lambda i: boxes[i][0])
-        for k, t in zip(pos, toks):
-            new_order[k] = t
-    return new_order, permute_labels(labels, order, new_order)
+        v = best_list[0]
+        E[best_u] = v; succ[best_u] = v
+        out_used.add(best_u); in_used.add(v)
+    return E
 ```
 
-⚠️ Bắt buộc hoán vị **cả `itc_labels`, `stc_labels`, `el_labels`** theo đúng permutation. `stc_labels` và `el_labels` là ma trận index → phải remap **cả hai chiều**. Sai chỗ này là bạn đang train trên nhãn rác:
+Với `M` cạnh ứng viên và candidate list đã sort sẵn, độ phức tạp là `O(M log d)` — hoàn toàn chạy được real-time trên vài trăm word box.
+
+**Vì sao formulation này đúng cho bạn:** nó cho ra **nhiều chuỗi rời rạc** (multiple disjoint paths), tức là nhiều dòng, chứ không ép toàn trang thành một chuỗi duy nhất. Line grouping và within-line ordering được giải đồng thời: mỗi path chính là một dòng, thứ tự trong path chính là thứ tự đọc. Không còn khâu clustering riêng để hỏng.
+
+### A.6 🔴 Chấm điểm cạnh: hình học **cộng** ngôn ngữ
+
+Ràng buộc cứng loại bỏ cạnh không hợp lệ; score xếp hạng phần còn lại.
+
+**Ràng buộc cứng (đặt score = −∞):**
 
 ```python
-def permute_labels(stc_label, old_to_new):
-    """stc_label[j] = i (predecessor). Cần remap cả key lẫn value."""
-    N = len(stc_label)
-    out = np.full(N, DUMMY, dtype=np.int64)
-    for j_old, i_old in enumerate(stc_label):
-        if i_old == DUMMY:
-            continue
-        out[old_to_new[j_old]] = old_to_new[i_old]
-    return out
+def hard_infeasible(bi, bj, theta_i, h_body):
+    if x_overlap_ratio(bi, bj) > 0.3:        return True   # §A.2
+    if bj[0] < bi[2] - 0.1 * (bi[2]-bi[0]):  return True   # j không ở bên phải i
+    d_par, d_perp = rotate_to_local_frame(bi, bj, theta_i)  # §A.4
+    if abs(d_perp) > 0.6 * h_body:           return True   # lệch dòng quá nhiều
+    if d_par > 6.0 * h_body:                 return True   # cách quá xa
+    return False
 ```
 
-Đây là cách biến **95% dữ liệu chữ in thành dữ liệu huấn luyện cho chính xác chế độ lỗi của 5% chữ tay** — mạnh hơn nhiều so với bbox augmentation vì nó chạm đúng vào kênh mà shortcut đi qua.
-
-Bắt đầu với `p = 0.3`, tăng dần nếu F1 chữ tay cải thiện mà F1 chữ in không giảm.
-
-### 4.2 🔴 Hoán vị `position_ids`
-
-Bổ sung cho §4.1, ở tầng khác:
+**Score hình học:**
 
 ```python
-# 30-50% sample: hoán vị position_ids, GIỮ NGUYÊN thứ tự input_ids và bbox
-if random.random() < 0.4:
-    position_ids = torch.randperm(L, device=dev)[None] + 2
-else:
-    position_ids = None   # để HF tự sinh arange
+s_geo = -w1 * (d_par / h_body) - w2 * abs(d_perp / h_body) - w3 * height_ratio_penalty(bi, bj)
 ```
 
-Khác biệt so với §4.1: §4.1 xáo trộn thứ tự thật (model thấy chuỗi khác), §4.2 giữ nguyên chuỗi nhưng làm nhiễu tín hiệu vị trí. Hai cái tấn công shortcut từ hai phía. Nên thử riêng lẻ trước để biết cái nào ăn điểm.
+**Score ngôn ngữ — đây là bổ sung mạnh nhất và bạn đang bỏ không.**
 
-Biến thể nhẹ hơn nếu §4.2 làm sập chất lượng ngôn ngữ: **scale 1D-PE bằng một hệ số học được** khởi tạo ở 1.0, để model tự quyết định giảm phụ thuộc.
+Bài 2026 nói trên chấm điểm cạnh bằng ensemble hai tín hiệu training-free: log-likelihood có điều kiện của một causal LM, và next-sentence-prediction của BERT. Ablation của họ cho thấy causal LM là tín hiệu chủ đạo, NSP đóng góp thêm ổn định, còn cosine similarity của sentence embedding **không giúp gì** và làm giảm kết quả khi tăng trọng số — nên bỏ hẳn.
 
-### 4.3 🟠 Shuffled-OCR SFT (LayTextLLM)
+Với tiếng Việt, đây là tín hiệu cực kỳ mạnh cho đúng ca của bạn:
 
-Kỹ thuật gốc: xáo trộn 20% số mẫu. Đây là phiên bản ít nhắm đích hơn §4.1 nhưng đã có tiền lệ công bố ([arXiv:2407.01976](https://arxiv.org/abs/2407.01976)). Dùng như đối chứng để chứng minh §4.1 (có mục tiêu) tốt hơn §4.3 (ngẫu nhiên) — nếu bằng nhau thì bạn tiết kiệm được công sức triển khai.
+```
+P("tháng" | "ngày mùng tám")           →  rất cao
+P("08"    | "ngày mùng tám")           →  rất thấp
+P("hai"   | "08")                       →  thấp
+```
 
-### 4.4 ⚠️ Bù lại tín hiệu đã lấy đi
+Model không cần hình học để biết `tám → tháng` là đúng. Một causal LM tiếng Việt nhỏ (hoặc chính XLM-R với masked-LM scoring) trả lời câu này gần như chắc chắn đúng.
 
-Khi bạn lấy đi shortcut mà không cho gì thay thế, model sẽ đơn giản là **kém đi**. §4 phải đi cùng §5 trong cùng một vòng train, không tách rời.
+```python
+def s_lm(text_u, text_v, lm, tok, kappa=0.5):
+    ids_u, ids_v = tok(text_u).input_ids, tok(text_v).input_ids
+    logits = lm(torch.tensor([ids_u + ids_v])).logits[0]
+    lp = 0.0
+    for k in range(len(ids_u), len(ids_u) + len(ids_v)):
+        lp += log_softmax(logits[k-1], -1)[ids_v[k - len(ids_u)]]
+    s = lp / len(ids_v)
+    return s - kappa * uncond_logprob(ids_v, lm) / len(ids_v)   # chuẩn hoá tần suất
+```
+
+Chi phí: cache score theo cặp, chỉ tính cho các cạnh vượt qua ràng buộc cứng (thường vài trăm cạnh mỗi trang). Trên GPU là dưới một giây.
+
+**Điểm cuối:**
+
+```
+S(u, v) = w_geo * s_geo + w_clm * s_clm + w_nsp * s_nsp
+```
+
+Tune trọng số **một lần** trên validation rồi cố định. Bài 2026 làm đúng vậy: sweep trên tập synthetic rồi transfer nguyên trọng số sang mọi dataset khác, không re-tune per document.
+
+### A.7 🟢 Neo theo template — rẻ nhất, mạnh nhất cho form cố định
+
+Giấy khai sinh là form in sẵn, bất biến. Các key in (`Họ và tên`, `Ngày, tháng, năm sinh`, `Ghi bằng chữ`, `Nơi sinh`, ...) luôn ở cùng vị trí tương đối và luôn là chữ in.
+
+Thuật toán:
+
+1. Nhận diện các key in bằng khớp chuỗi (chúng đọc rất chuẩn vì là chữ in)
+2. Ước lượng biến đổi affine/homography từ vị trí key phát hiện được → vị trí key trong template chuẩn. **Đây cũng là bước deskew/dewarp chính xác hơn deskew toàn trang**, vì nó dùng chính điểm neo trong tài liệu.
+3. Với mỗi word chữ tay, ánh xạ về toạ độ template → xác định nó thuộc **vùng field nào**
+4. Trong mỗi field, sắp xếp bằng A.5 nhưng không gian tìm kiếm chỉ còn 5–15 word
+
+Lợi ích: bài toán từ "sắp xếp 200 word trên trang nghiêng" thành "sắp xếp 8 word trong một ô đã biết trước". Sai số gần như không thể xảy ra. Ràng buộc: chỉ áp dụng được cho các loại mẫu bạn đã biết — nhưng bạn nói chỉ một số loại mẫu như giấy khai sinh mới trộn chữ tay và chữ in, nên độ phủ có thể rất cao.
+
+Tôi khuyến nghị **làm A.7 trước A.5** nếu tập template của bạn hữu hạn. Nó rẻ hơn, dễ verify hơn, và chạy được ngay.
+
+### A.8 Đo lường
+
+Metric cho tầng reading order, độc lập với KIE:
+
+```python
+edge_accuracy = (# word có successor dự đoán khớp GT) / (# word không phải cuối chuỗi)
+```
+
+Đây là metric của bài 2026 và nó đúng cho bạn: nó đo trực tiếp thứ bạn cần, tách khỏi mọi nhiễu của model KIE. Tách riêng printed / handwritten, và tách riêng **lỗi trong dòng** (same-line skip) với **lỗi nhảy dòng** (cross-line link).
+
+Bạn có sẵn ground truth: chuỗi GT của mỗi entity đã mã hoá thứ tự đúng. Không cần annotate thêm.
 
 ---
 
-## 5. Sprint B — Tăng tín hiệu hình học
+## Phần B — Hướng 2: ép model thực sự học
 
-### 5.1 🔴 Geometric bias trong pair score, dùng khung toạ độ cục bộ
+### B.0 Nguyên tắc
 
-Head bilinear của BROS chỉ thấy hình học **gián tiếp** qua hidden state. Cộng bias tính trực tiếp từ toạ độ:
+Model học shortcut vì shortcut **có tương quan cao với nhãn trong tập train**. Cách duy nhất để phá là làm cho tương quan đó biến mất. Ba mức độ can thiệp, từ nhẹ đến nặng:
 
-```python
-class GeoBiasedPairScore(nn.Module):
-    def __init__(self, d, n_geo=14, d_geo=64):
-        super().__init__()
-        self.q, self.k = nn.Linear(d, d), nn.Linear(d, d)
-        self.geo = nn.Sequential(nn.Linear(n_geo, d_geo), nn.GELU(), nn.Linear(d_geo, 1))
-        self.scale = d ** -0.5
-
-    def forward(self, h, geo_feat):          # geo_feat: (B, N, N, n_geo)
-        content = (self.q(h) @ self.k(h).transpose(-1, -2)) * self.scale
-        return content + self.geo(geo_feat).squeeze(-1)
-```
-
-**Về feature hình học — bạn đã deskew/dewarp nên lo ngại ban đầu giảm đáng kể, nhưng chưa biến mất.** Deskew ở mức trang không sửa được **baseline drift và slant trong từng dòng chữ tay** — người viết tay vẫn đi lên đi xuống trong cùng một dòng. Nên vẫn dùng khung cục bộ, nhưng bây giờ nó là biện pháp phòng ngừa chứ không phải yêu cầu bắt buộc:
-
-```python
-def local_frame_features(boxes, i, j, neigh_k=7):
-    """Vị trí tương đối của j so với i, trong hệ toạ độ xoay theo hướng dòng cục bộ tại i."""
-    theta = fit_local_baseline(boxes, i, k=neigh_k)   # regression y_center ~ x qua k box lân cận
-    h_loc = local_xheight(boxes, i, k=neigh_k)        # percentile 25-75, tránh dấu tiếng Việt
-    dx, dy = center(boxes[j]) - center(boxes[i])
-    d_par  = ( dx * cos(theta) + dy * sin(theta)) / h_loc   # dọc theo dòng
-    d_perp = (-dx * sin(theta) + dy * cos(theta)) / h_loc   # vuông góc với dòng
-    return [d_par, d_perp,
-            iou_x(boxes[i], boxes[j]), iou_y(boxes[i], boxes[j]),
-            width(boxes[j]) / width(boxes[i]), h_loc_ratio(boxes, i, j),
-            gap_x(boxes[i], boxes[j]) / h_loc,
-            float(d_perp > 0.5), float(d_perp < -0.5),      # xuống dòng / lên dòng
-            *margin_features(boxes, i), *margin_features(boxes, j)]
-```
-
-Điểm mấu chốt: đây vẫn là **hình học học được**, không phải thuật toán cứng. Bạn không áp đặt quy tắc "phải nối sang phải" — bạn chỉ đưa cho model tín hiệu ở dạng bất biến với skew và để nó tự quyết định.
-
-Tiền lệ: đây là **spatial compatibility attention bias** của KVPFormer ([arXiv:2304.07957](https://arxiv.org/abs/2304.07957)), thứ giúp họ đạt kết quả mạnh trên RE **mà không cần pre-training** — nên port sang LayoutXLM được. GeoLayoutLM ([arXiv:2304.10759](https://arxiv.org/abs/2304.10759)) cũng chỉ ra rằng hình học tường minh mới là yếu tố quyết định ở RE, còn LayoutLMv3 phụ thuộc quá mức vào ngữ nghĩa.
-
-### 5.2 🟠 Feature lề — phân biệt "value xuống dòng" với "value dừng giữa dòng"
-
-Đây là ràng buộc mà form của bạn cần model học được, và nó rẻ:
-
-| Feature | Ý nghĩa |
-|---|---|
-| `is_line_final`, `is_line_initial` | Token cuối/đầu dòng |
-| `dist_to_right_margin / char_width` | Value xuống dòng thường kết thúc **gần lề phải** |
-| `left_indent / char_width` | Dòng tiếp theo của value thường thụt lề khác dòng mới |
-| `n_kv_pairs_on_line` | Dòng `Dân tộc: Kinh · Quốc tịch: Việt Nam · Năm sinh: 1980` có 3 cặp |
-
-Nhóm cuối đáng chú ý riêng: form giấy khai sinh có nhiều dòng chứa 2–3 cặp key–value. Model phải học "dừng value trước khi key kế tiếp bắt đầu". **Đo riêng error rate trên dòng đa-cặp so với dòng đơn-cặp** — tôi ngờ đây là nhóm lỗi lớn thứ hai sau shortcut.
-
-### 5.3 🟢 Bật `has_spatial_attention_bias` — tận dụng cơ chế đang bỏ không
-
-Như §3.3, LayoutXLM tắt cờ này và không có pretrained weight. Nhưng **module này rất nhỏ**: bảng bias `rel_2d_pos_bins × num_heads` cho x và y, chia sẻ giữa các layer. Train from scratch hoàn toàn khả thi khi bạn đang fine-tune trên dữ liệu domain-specific.
-
-```python
-cfg.has_spatial_attention_bias = True
-model = LayoutLMv2Model.from_pretrained(path, config=cfg)   # bias init ngẫu nhiên
-# đặt LR riêng cho các tham số bias, cao hơn backbone
-```
-
-Lợi ích: đưa hình học vào **mọi layer attention**, không chỉ ở pair head cuối cùng. Đây đúng là thứ bạn cần khi đang cố giảm phụ thuộc vào 1D-PE.
-
-⚠️ Rủi ro: bias khởi tạo ngẫu nhiên trong 12 layer có thể phá vỡ biểu diễn pretrain giai đoạn đầu. Giảm thiểu bằng: khởi tạo bias ≈ 0, warmup dài hơn, và **giữ `has_relative_attention_bias = False`** (bias 1D — bạn đang muốn giảm phụ thuộc thứ tự, không phải tăng).
-
-Đây là một ablation độc lập, đo được rõ ràng. Đáng thử vì chi phí thấp và không ai ngăn bạn tắt lại.
-
----
-
-## 6. Sprint C — Thay đổi cấu trúc head
-
-Phần này bạn chưa thử. Giữ nguyên từ v2 và bổ sung cách kết hợp với chẩn đoán mới.
-
-### 6.1 🔴 BIO head phụ trợ + ensemble lúc decode
-
-Nếu §1.4 cho thấy phần lớn offset GT là `+1`, chuỗi STC gần tương đương segmentation liên tục. Một head BIO song song **không thể sinh zigzag về mặt cấu trúc**:
-
-```python
-score(i → j) = log p_stc(i → j) + β · log p_bio(j = continuation)
-```
-
-Cơ chế: khi STC lưỡng lự (softmax phẳng — đúng triệu chứng bạn quan sát), BIO kéo về nghiệm liên tục. Khi entity thật sự gián đoạn, STC đủ tự tin để thắng.
-
-Chi phí: một linear head 3 lớp. Nhãn suy trực tiếp từ chuỗi GT hiện có, **không cần annotate lại gì cả**. Đây có lẽ là tỉ lệ lợi ích/công sức cao nhất trong Sprint C.
-
-### 6.2 🟠 Head đối xứng — gom nhóm thay vì chuỗi có hướng
-
-Bạn đã cân nhắc và từ chối vì lo thuật toán sắp xếp theo x/y nhầm khi ảnh nghiêng. Hai điểm đáng xem lại:
-
-**(a) OCR của bạn đã deskew/dewarp.** Lo ngại ban đầu giảm đáng kể. Phần còn lại là baseline drift trong dòng chữ tay — xử lý được bằng khung cục bộ (§5.1) chứ không cần threshold cứng.
-
-**(b) Thứ tự trong `ocr.txt` đã là kết quả của một thuật toán sắp xếp hình học rồi** — thuật toán của OCR engine, mà bạn không kiểm soát và nó đang sai. Lựa chọn thực tế không phải "thuật toán hay model", mà là **"thuật toán bạn kiểm soát hay thuật toán bạn không kiểm soát"**.
-
-Nếu vẫn muốn giữ quyết định thứ tự cho model, có phương án lai:
-
-```python
-# head đối xứng quyết định GOM NHÓM (bất biến thứ tự, dễ học)
-S = 0.5 * (P_pair + P_pair.T)
-groups = connected_components(S > tau)
-
-# thứ tự trong nhóm: STC head cũ, nhưng chỉ trên tập ứng viên nhỏ (≤10 token)
-# → không gian tìm kiếm giảm từ N² xuống k², softmax sắc hơn nhiều
-```
-
-Tách bài toán làm hai: "hai token này cùng entity không" (dễ, bất biến thứ tự) và "thứ tự trong nhóm 8 token" (dễ hơn nhiều so với chọn 1 trong 512). Model vẫn quyết định thứ tự, nhưng ở quy mô mà nó có thể học được.
-
-Test rẻ: chạy nhánh gom nhóm với checkpoint hiện tại, đo bằng metric frozenset (§2.6a). Nếu F1 gom nhóm cao hơn F1 exact nhiều → hướng này đúng.
-
-### 6.3 🟠 GOSE — head thay thế phù hợp nhất
-
-[arXiv:2305.13850](https://arxiv.org/abs/2305.13850) · [GitHub](https://github.com/chenxn2020/GOSE) · EMNLP 2023 Findings
-
-Repo chính thức dùng trực tiếp **LayoutXLM và LiLT** làm backbone — chi phí tích hợp thấp nhất trong các phương án.
-
-Cơ chế: dự đoán quan hệ sơ bộ → khai thác *global structure knowledge* từ vòng trước → nhúng ngược vào biểu diễn entity → lặp K lần. Có thêm **spatial prefix** guide attention.
-
-Vì sao phù hợp với chẩn đoán mới: bài báo nêu chính xác vấn đề của head độc lập — thiếu cấu trúc toàn cục khiến model *"struggle to learn long-range relations and easily predict conflicted results"*. Softmax phẳng của bạn là biểu hiện của việc mỗi cặp được quyết định độc lập, không có thông tin về các quyết định khác. GOSE giải ở **tầng học** thay vì tầng decode — mà tầng decode thì bạn đã chứng minh là vô ích.
-
-### 6.4 🟠 PEneo — về cấu trúc không thể sinh zigzag
-
-[arXiv:2401.03472](https://arxiv.org/abs/2401.03472) · [code](https://github.com/ZeningLin/PEneo)
-
-Line grouping bằng **hai ma trận** head/tail (handshaking, kế thừa từ TPLinker) thay vì chuỗi tuần tự. Không có khái niệm "successor" nên **không thể sinh zigzag**.
-
-Bản gốc cần re-annotate mức dòng, nhưng với nhãn hiện tại của bạn (chuỗi token có thứ tự) bạn **suy ra được nhãn cạnh head/tail** mà không cần annotate tay — chỉ là chuyển đổi format.
-
-⚠️ License: non-commercial research only. Với production ở công ty, dùng làm tham khảo ý tưởng chứ đừng copy code.
-
-### 6.5 🟡 EL đang vứt bỏ nội dung của value
-
-Với `Ngày tháng năm sinh : 08/6/2011 ...`, head EL chỉ thấy first-token của key và first-token của value. Toàn bộ nội dung còn lại bị bỏ.
-
-```python
-e_i = torch.cat([h[first_i], h[span_i].mean(0), h[last_i]], dim=-1)
-```
-
-Rủi ro: train/inference mismatch. Giảm thiểu bằng **scheduled sampling** — tăng dần tỉ lệ dùng span dự đoán (0% → 50% qua các epoch).
-
-> ⚠️ Kiểm tra ngay (§2.6e): nếu loss EL đang tính trên first-token **ground-truth** nhưng inference dùng first-token **dự đoán**, thì đã có sẵn mismatch — model chưa bao giờ học cách xử lý entity sai. Đây là ứng viên mạnh cho hiện tượng "validation tốt mà inference sai".
-
-### 6.6 Các lựa chọn khác
-
-| Method | Link | Ghi chú với chẩn đoán mới |
+| Mức | Cơ chế | Rủi ro |
 |---|---|---|
-| **UNER** | [arXiv:2408.01038](https://arxiv.org/abs/2408.01038) | Xử lý entity **gián đoạn** — đúng bài toán §7.1 dưới đây |
-| **RE2** | [arXiv:2305.14590](https://arxiv.org/abs/2305.14590) | Edge-aware GAT + constraint objective |
-| **TPP** | [arXiv:2310.11016](https://arxiv.org/abs/2310.11016) | Token path prediction. Tốn memory |
-| **GeoLayoutLM** | [arXiv:2304.10759](https://arxiv.org/abs/2304.10759) | RFE head chỉ 3.5% tham số, nhưng một phần lợi ích nằm ở pre-training bạn không có |
-| **RORE** | [arXiv:2409.19672](https://arxiv.org/abs/2409.19672) | Model reading-order riêng, chịu skew, dùng pseudo-label. Xem §7.3 |
+| B.1 | Augmentation: làm nhiễu thứ tự | Thấp |
+| B.2 | Consistency loss: phạt khi output đổi theo thứ tự | Trung bình |
+| B.3 | Adversarial: ép hidden state không mã hoá thứ tự | Cao |
 
----
+### B.1 🔴 Augmentation ở đúng mức granularity
 
-## 7. Vấn đề nhãn — cần quyết định, không phải kỹ thuật
+Đã nêu ở v3 §4.1, nhưng có một chi tiết kỹ thuật quan trọng chưa nói:
 
-### 7.1 🔴 `Ghi bằng chữ` là key in sẵn nhưng đang bị gán vào value
-
-Đây có thể là vấn đề nghiêm trọng và độc lập với mọi thứ ở trên.
-
-Trên form giấy khai sinh, `Ghi bằng chữ:` là **chữ in, có dấu hai chấm, nằm giữa dòng** — về mọi mặt hình thức nó là một key, y hệt `Nơi sinh:` hay `Dân tộc:`. Quy ước nhãn hiện tại của bạn buộc model phải:
-
-- Nhận `Ghi bằng chữ` là **một phần của value**, trong khi mọi token có đặc điểm hình thức giống hệt ở khắp form đều là **key**
-- Học một entity **gián đoạn về mặt ngữ nghĩa**: value = `08/6/2011` + `ngày mùng tám tháng sáu...`, với một cụm chữ in chen giữa
-
-Đây là hai tín hiệu mâu thuẫn trực tiếp với nhau. Model không có cách nào phân biệt `Ghi bằng chữ` (phải nuốt) với `Quốc tịch` (phải dừng) ngoài việc học thuộc lòng chuỗi ký tự cụ thể đó.
-
-**Đề xuất: tách thành hai cặp key–value độc lập, rồi gộp ở post-process.**
-
-```
-key: "Ngày, tháng, năm sinh"  →  value: "08/6/2011"
-key: "Ghi bằng chữ"           →  value: "ngày mùng tám tháng sáu năm hai nghìn không trăm mười một"
-
-# post-process: với template giấy khai sinh, merge hai cặp này thành một field
-```
-
-Lợi ích: nhãn trở nên nhất quán với hình thức trực quan, entity trở thành liên tục, và việc gộp là một quy tắc template đơn giản mà bạn kiểm soát hoàn toàn.
-
-**Kiểm tra ngay:** đo error rate của các entity **liên tục** so với các entity **có key in chen giữa**. Nếu chênh lệch lớn, đây là nguyên nhân độc lập cần sửa bằng nhãn chứ không bằng model.
-
-### 7.2 🟠 Audit nhất quán trên toàn tập
-
-Kiểm tra 20–30 giấy khai sinh: `Ghi bằng chữ` có **luôn** được đánh cùng một cách không? Các trường nhiều cặp trên một dòng (`Dân tộc · Quốc tịch · Năm sinh`) có nhất quán không? Label noise ở mức vài phần trăm trong 5% dữ liệu chữ tay là đủ để triệt tiêu mọi cải thiện bạn đo được.
-
-### 7.3 🟡 Reading order như một module riêng
-
-Nếu §1.4 rơi vào trường hợp (a) — GT bị nhiễm thứ tự OCR sai — thì đây không còn là lựa chọn mà là bắt buộc.
-
-Hai hướng:
-
-- **Sửa line grouping trước khi tạo chuỗi token.** Ràng buộc mấu chốt: hai token cùng dòng **không được chồng lấn theo x**. Ràng buộc này chữ tay không phá vỡ, khác với y-threshold. Kèm theo: ước lượng chiều cao **thân chữ** (percentile 25–75 của y-center) thay vì chiều cao bbox, vì dấu tiếng Việt làm bbox cao gấp rưỡi và đó chính là thứ khiến OCR engine gộp nhầm hai dòng.
-- **RORE** ([arXiv:2409.19672](https://arxiv.org/abs/2409.19672)) — ma trận nhị phân n×n + relation-aware attention, dùng pseudo-label từ model ROP có sẵn. Vẫn là "để model quyết định", nhưng tách bạch khỏi KIE nên dễ debug và dễ đo hơn nhiều.
-
-⚠️ **Dù chọn hướng nào, vẫn phải làm §4.** Nếu không, model chỉ chuyển từ phụ thuộc vào thứ tự OCR sang phụ thuộc vào thứ tự của module mới — shortcut còn nguyên, và bạn gặp lại đúng vấn đề này khi module mới sai.
-
----
-
-## 8. Sprint D — Dữ liệu
-
-### 8.1 🔴 Synthetic chữ tay với **điểm ngắt dòng biến thiên**
-
-Với 5% chữ tay và lỗi tập trung ở vài template cố định, đây là hướng ROI cao nhất.
-
-Cơ chế cần mô phỏng: **độ rộng nét chữ quyết định chỗ ngắt dòng.** Người viết chữ to thì `ngày mùng tám` ngắt sau `mùng`; viết chữ nhỏ thì ngắt sau `tám` hoặc `tháng`. Layout giống hệt nhau nhưng cấu hình hình học tại đúng link khó nhất thì mỗi mẫu một khác — và điều này giải thích trọn vẹn hiện tượng "hai mẫu gần giống nhau, một đúng một sai" của bạn.
-
-```
-render value bằng font handwriting (hoặc model HTG) vào template giấy khai sinh in sẵn
-  · biến thiên MẠNH độ rộng nét chữ  →  điểm ngắt dòng rơi vào mọi vị trí có thể
-  · biến thiên baseline drift, slant, chiều cao từng chữ
-  · giữ nguyên nhãn (bạn kiểm soát nội dung)
-  · chạy qua CHÍNH OCR engine production để lấy thứ tự token thật, kể cả khi nó sai
-```
-
-Điểm cuối quan trọng nhất: **đừng sinh thứ tự token nhân tạo**. Cho ảnh synthetic đi qua đúng OCR engine bạn dùng, để dữ liệu train chứa đúng phân bố lỗi thứ tự mà production gặp.
-
-Vài nghìn mẫu như vậy dạy model đúng cái bất biến nó đang thiếu: *"chỗ ngắt dòng ở đâu không quan trọng"*.
-
-Tham khảo: [Advancing Offline HTR (2025)](https://arxiv.org/abs/2507.06275).
-
-### 8.2 🟠 Augraphy — 6 augmentation đã sàng lọc
-
-`InkBleed` · `Letterpress` · `LowInkRandomLines` · `LowInkPeriodicLines` · `JPEG` · `DirtyScreen`
-
-Danh sách từ một paper giải đúng bài toán domain gap digital→handwritten trên Form-NLU ([arXiv:2502.06132](https://arxiv.org/abs/2502.06132)). Khỏi grid search 24 cái.
-
-Lưu ý: cái này ảnh hưởng đến **chất lượng OCR**, không ảnh hưởng đến shortcut. Nó nằm ở tầng khác và bổ trợ chứ không thay thế §4.
-
-### 8.3 🟠 Cân bằng domain
-
-- Oversample document chữ tay lên **30–40% mỗi batch** (`WeightedRandomSampler`). Với 5%, tỉ lệ này quan trọng hơn nhiều so với khi có 10%.
-- Fine-tune hai giai đoạn: train toàn bộ → fine-tune LR thấp trên tập chữ tay
-- **Luôn báo cáo metric tách hai domain.** Con số 95% tổng thể đang che giấu vấn đề.
-
-### 8.4 🟡 Line-normalized bbox (giữ từ v2, hạ ưu tiên)
+⚠️ **Hoán vị ở mức WORD, không ở mức TOKEN.** XLM-R tách `phường` thành nhiều subword. Nếu bạn hoán vị ở mức token, các subword của cùng một từ bị tách rời và biểu diễn ngôn ngữ sụp đổ hoàn toàn — bạn sẽ kết luận nhầm rằng "phá shortcut làm model kém đi".
 
 ```python
-def line_normalize_boxes(boxes, tol=0.6):
-    h_med   = np.median([b[3] - b[1] for b in boxes])
-    yc      = np.array([(b[1] + b[3]) / 2 for b in boxes])
-    line_id = cluster_1d(yc, eps=tol * h_med)
-    out = np.array(boxes, dtype=float).copy()
-    for lid in np.unique(line_id):
-        m = line_id == lid
-        out[m, 1], out[m, 3] = np.median(out[m, 1]), np.median(out[m, 3])
-    return out, line_id
+def permute_words(word_groups, perm):
+    """word_groups: list các list token index thuộc cùng một word.
+    Hoán vị THỨ TỰ CÁC WORD, giữ nguyên thứ tự subword bên trong."""
+    new_order = []
+    for w in perm:
+        new_order.extend(word_groups[w])      # subword giữ nguyên thứ tự
+    return new_order
 ```
 
-Vẫn hợp lý về nguyên tắc — `y0/y1` của chữ tay đang mã hoá **độ cao nét chữ** chứ không mã hoá **dòng**. Nhưng nó không chạm vào shortcut, nên xếp sau §4 và §5. Biến thể đáng thử: giữ cả hai tín hiệu — box chuẩn hoá vào layout embedding, `h_gốc / h_median` đưa vào head như feature phụ.
+Phân bố hoán vị nên mô phỏng đúng lỗi thuật toán của bạn (gộp hai dòng liền kề rồi sắp theo x), không phải hoán vị ngẫu nhiên. Xem v3 §4.1.
+
+### B.2 🔴 Consistency loss giữa hai hoán vị — đề xuất mạnh nhất của hướng 2
+
+Đây là cách trực tiếp nhất để **định nghĩa** tính bất biến thứ tự thành một mục tiêu tối ưu, thay vì hy vọng model tự học được.
+
+Cho cùng một document đi qua model **hai lần** với hai thứ tự token khác nhau, rồi phạt khoảng cách giữa hai phân bố dự đoán sau khi ánh xạ về cùng một không gian index chuẩn:
+
+```python
+def order_consistency_loss(model, batch, perm):
+    out_a = model(**batch)                              # thứ tự gốc
+    out_b = model(**apply_perm(batch, perm))            # thứ tự hoán vị
+
+    # ánh xạ output của b về không gian index của a
+    p_a = softmax(out_a.stc_logits, -1)                 # (N, N+1)
+    p_b = softmax(unpermute(out_b.stc_logits, perm), -1)
+
+    return 0.5 * (kl(p_a, p_b.detach()) + kl(p_b, p_a.detach()))
+
+loss = l_itc + λ_stc*l_stc + λ_el*l_el + λ_cons * order_consistency_loss(...)
+```
+
+Vì sao mạnh hơn augmentation đơn thuần: augmentation chỉ dạy model rằng "thứ tự đôi khi khác", còn consistency loss dạy model rằng **output không được phép thay đổi khi thứ tự thay đổi**. Đó là ràng buộc đúng, và nó áp dụng cho mọi sample chứ không chỉ sample được augment.
+
+Chi phí: gấp đôi forward pass. Có thể giảm bằng cách chỉ áp cho 30% batch.
+
+⚠️ Cẩn thận với `unpermute` trên ma trận `(N, N+1)`: phải hoán vị **cả hai chiều** và xử lý cột dummy riêng. Sai chỗ này là loss trở thành nhiễu thuần tuý. Viết unit test: với `perm = identity`, loss phải bằng 0 chính xác.
+
+### B.3 🟠 Adversarial debiasing — ép hidden state quên thứ tự
+
+Nếu B.1 và B.2 chưa đủ, đây là can thiệp trực tiếp nhất: gắn một head phụ cố gắng **dự đoán chỉ số OCR của token từ hidden state**, và nối nó qua gradient reversal layer.
+
+```python
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd; return x.view_as(x)
+    @staticmethod
+    def backward(ctx, g):
+        return -ctx.lambd * g, None
+
+# head phụ: từ h_i đoán rank chuẩn hoá của token i trong chuỗi OCR
+pos_pred = pos_head(GradReverse.apply(h, lambd))       # (N, 1)
+l_adv    = F.mse_loss(pos_pred.squeeze(-1), norm_rank)
+
+loss = ... + l_adv     # gradient reversal → backbone bị ép XOÁ thông tin thứ tự
+```
+
+Ý nghĩa: head phụ càng khó đoán được thứ tự OCR từ hidden state, thì hidden state càng ít mã hoá shortcut. `lambd` tăng dần theo schedule (0 → 0.1) để không phá training giai đoạn đầu.
+
+⚠️ Rủi ro thật: gradient reversal nổi tiếng khó tune và có thể làm sụp training. Chỉ dùng nếu B.1 + B.2 đã cho kết quả nhưng chưa đủ. Và luôn giữ một baseline không adversarial để so sánh.
+
+### B.4 🟠 Curriculum, không phải bật/tắt
+
+Đừng bật augmentation 100% từ epoch 0. Model chưa có biểu diễn hình học tốt sẽ chỉ học được nhiễu.
+
+```
+epoch 0-10   : p_permute = 0.0      # học biểu diễn cơ bản với thứ tự sạch
+epoch 10-30  : p_permute 0.0 → 0.4  # tăng tuyến tính
+epoch 30+    : p_permute = 0.4, bật λ_cons
+```
+
+### B.5 🟢 Ensemble theo hoán vị lúc inference
+
+Rẻ, không cần train lại, và cho bạn một tín hiệu chẩn đoán miễn phí:
+
+```python
+# chạy K=5 hoán vị khác nhau, ánh xạ về index gốc, trung bình score matrix
+S = mean([unpermute(model(perm_k(x)).stc_logits, perm_k) for k in range(K)])
+pred = decode(S)
+```
+
+Hai lợi ích:
+- **Giảm variance**: nếu một hoán vị rơi vào trường hợp shortcut sai, các hoán vị khác kéo lại
+- **Đo bất biến trực tiếp**: độ phân tán giữa K dự đoán chính là thước đo "model phụ thuộc thứ tự bao nhiêu". Đây là metric bạn nên báo cáo cho mọi thí nghiệm ở hướng 2.
+
+Thử ngay với checkpoint hiện tại — nếu nó đã cải thiện, bạn có bằng chứng mạnh rằng hướng 2 đáng đầu tư.
+
+### B.6 🟠 Multi-task: cho model tự dự đoán reading order
+
+Thay vì lấy đi thứ tự, hãy **dạy model thứ tự đúng** như một task phụ:
+
+```python
+# head phụ: p(j là successor của i trong reading order đúng)  — ma trận (N, N)
+l_ro = cross_entropy(ro_logits, gt_reading_order_successor)
+loss = ... + λ_ro * l_ro
+```
+
+Nhãn có sẵn từ chuỗi GT của bạn. Lợi ích: hidden state buộc phải mã hoá "thứ tự đúng theo hình học và ngữ nghĩa" chứ không phải "thứ tự trong file OCR" — hai thứ khác nhau, và ép model phân biệt chúng chính là điều bạn muốn.
+
+Đây cũng là cầu nối giữa hai hướng: head này có thể **thay thế** thuật toán ở Phần A, hoặc dùng để cross-check nó (khi hai bên bất đồng → abstain).
+
+Tiền lệ: TPP ([arXiv:2310.11016](https://arxiv.org/abs/2310.11016)) xác nhận rằng một model dự đoán reading order dùng để sửa chuỗi token đầu vào cho các model layout-aware là có hiệu quả. RORE ([arXiv:2409.19672](https://arxiv.org/abs/2409.19672)) mô hình hoá reading order như quan hệ thứ tự bằng ma trận nhị phân n×n, dùng được pseudo-label.
 
 ---
 
-## 9. Loss & training
+## Phần C — So sánh và chiến lược
 
-### 9.1 🟠 λ weighting cho 3 loss
+### C.1 Hai hướng giải hai bài toán khác nhau
 
-| Head | Số lớp | Tỉ lệ dương |
+| | Hướng 1 (thuật toán) | Hướng 2 (model) |
 |---|---|---|
-| ITC | C+1 (~5–20) | cao |
-| STC | N+1 (~513) | ~1/N |
-| EL | N+1 (~513) | ~1/N |
+| Giải quyết | Đầu vào sai | Model không chịu được đầu vào sai |
+| Verify được không? | ✅ Có — `edge_accuracy` đo trực tiếp | ❌ Khó — chỉ đo gián tiếp qua F1 |
+| Cần train lại? | Không | Có, nhiều vòng |
+| Rủi ro | Thấp, deterministic, debug được | Có thể làm model kém đi |
+| Trần trên | Bị giới hạn bởi chất lượng OCR box | Không rõ |
+| Thời gian tới production | Ngày–tuần | Tuần–tháng |
 
-CE trên 513 lớp có scale khác hẳn CE trên 10 lớp. Tổng thô nghĩa là bạn đang **ngầm gán trọng số theo cardinality**, không theo tầm quan trọng.
+**Hướng 1 nên làm trước.** Không phải vì nó tốt hơn, mà vì:
 
-```python
-loss = l_itc + λ_stc * l_stc + λ_el * l_el
+1. Bạn **đã chứng minh** nó hoạt động — sửa tay thứ tự thì model hoàn hảo. Đây là bằng chứng thực nghiệm mạnh nhất bạn có trong toàn bộ dự án.
+2. Nó verify được độc lập, không cần train lại.
+3. Nó **sinh ra dữ liệu cho hướng 2**: một khi có thứ tự đúng, bạn có nhãn reading order để train head ở B.6, và có cặp (thứ tự sai, thứ tự đúng) để làm augmentation ở B.1.
+
+**Nhưng đừng dừng ở hướng 1.** Một pipeline chỉ dựa vào thuật toán sắp xếp sẽ hỏng lặng lẽ khi gặp mẫu lạ trong production. Hướng 2 là bảo hiểm, và ít nhất B.5 (ensemble hoán vị) nên có mặt trong mọi phiên bản production.
+
+### C.2 Kiến trúc pipeline tôi đề nghị
+
+```
+ảnh
+ └─ deskew/dewarp (đã có)
+     └─ OCR → word boxes + text
+         └─ [A.7] neo template nếu nhận diện được form
+             └─ [A.5] max-regret path cover
+                  score = hình học (A.6) + LM tiếng Việt (A.6)
+                  ràng buộc cứng = x-overlap (A.2) + thân chữ (A.3) + skew cục bộ (A.4)
+                 └─ thứ tự token
+                     └─ LayoutXLM + 3 head
+                         [B.5] ensemble K hoán vị → score matrix trung bình
+                        └─ decode
+                            └─ [v3 §10.1] abstention theo margin
+                                └─ [v3 §10.2] post-process template + cross-check số↔chữ
 ```
 
-Ablation `λ ∈ {0.5, 1, 2, 5}`. Rẻ, thường ăn 0.5–1.5 điểm.
+Ba tầng phòng vệ độc lập: thuật toán đúng → model bền → hậu xử lý bắt lỗi còn sót. Không tầng nào phải hoàn hảo.
 
-> Lưu ý: §4.2 của v2 (banded head) từng được đề xuất như cách giảm mất cân bằng — **đã bị xoá** vì lý do §2.4. Thay thế bằng focal loss hoặc hard negative mining.
+### C.3 Lộ trình
 
-### 9.2 🟠 Focal loss + hard negative mining
+**Tuần 1 — verify và vá**
 
-- **Focal loss** (γ=2) cho STC/EL ([arXiv:1708.02002](https://arxiv.org/abs/1708.02002))
-- **Hard negative mining**: chỉ lấy top-k negative có loss cao nhất (k ≈ 20× số positive)
-
-Với softmax phẳng như bạn quan sát, focal loss đặc biệt đáng thử: nó tăng gradient ở đúng những ví dụ model đang lưỡng lự.
-
-### 9.3 🟡 Consistency regularization
-
-```python
-# token được ITC coi là first-token thì không nên là successor của token khác
-L_consist = (p_itc_is_first * p_stc_has_predecessor).sum() / N
-loss = ... + λ_c * L_consist
-```
-
-> `L_uniq` (phạt nhiều successor) của v2 **đã bị xoá** — bạn đã đo và xác nhận không có xung đột successor. Không có gì để phạt.
-
-### 9.4 Chi tiết dễ ăn điểm
-
-- **Layer-wise LR**: backbone 2e-6 ~ 5e-6, head 1e-4 (PEneo dùng đúng cấu hình này). Với §5.3 (spatial bias train from scratch), đặt nhóm LR thứ ba cao hơn.
-- **Train lâu hơn bạn nghĩ**: PEneo fine-tune **650 epoch** trên RFUND. Nếu bạn đang train 50–100 epoch, có thể chưa hội tụ — và điều này đặc biệt đúng sau khi bạn phá shortcut, vì bài toán trở nên khó hơn.
-- EMA weights, label smoothing 0.05–0.1 cho ITC
-- Ensemble 3–5 seed, average **score matrix** trước khi decode
-
----
-
-## 10. Production — vá ngay, không cần train lại
-
-### 10.1 🔴 Abstention theo margin
-
-Softmax phẳng là một **tín hiệu abstention rất đáng tin** trong trường hợp của bạn, vì phẳng tương ứng khá sạch với "model không biết" (khác với trường hợp model tự tin sai, vốn không phát hiện được).
-
-```python
-margin = p_top1 - p_top2
-doc_min_margin = min(margin[i] for i in all_predicted_links)
-if doc_min_margin < tau:
-    route_to_review(doc)      # hoặc rơi về post-process template
-```
-
-Calibrate `tau` trên validation: vẽ đường cong precision vs. coverage, chọn điểm phù hợp SLA. Đây là thứ chạy được **trong tuần này**, trong khi mọi thay đổi training cần vài vòng train.
-
-### 10.2 🟠 Post-process theo template
-
-Giấy khai sinh là form cố định. Bạn biết trước có bao nhiêu field, field nào ở đâu, field nào là ngày/năm/tên người. Với các document bị abstain:
-
-- Ghép lại value từ các mảnh token bằng quy tắc template, **không cần đúng thứ tự nối của model**
-- Cross-check: `08/6/2011` phải khớp với `ngày mùng tám tháng sáu năm hai nghìn không trăm mười một`. Hai biểu diễn của cùng một thông tin là **tài nguyên kiểm tra chéo miễn phí**, không phải chỉ là nguồn nhiễu (§2.5)
-- Validate `Năm sinh` của cha/mẹ < `Năm sinh` của con, quốc tịch thuộc tập hữu hạn, v.v.
-
-Không sang, nhưng với form pháp lý cố định đây là lựa chọn đúng và nó ăn nốt phần đuôi rẻ hơn bất kỳ thay đổi kiến trúc nào.
-
----
-
-## 11. Lộ trình
-
-### Sprint 0′ — Chẩn đoán (nửa ngày, không train)
-
-| # | Việc | Ưu tiên | Quyết định điều gì |
-|---|---|---|---|
-| 1.4 | Kiểm tra tính đơn điệu của GT chain + phân bố offset | 🔴 | Toàn bộ tài liệu này có áp dụng được không |
-| 2.1 | Permutation test trên mẫu chữ in đang đúng | 🔴 | Shortcut có thật không |
-| 2.2 | Ablation `position_ids` | 🔴 | Mức độ phụ thuộc 1D-PE |
-| 2.3 | Phân tích link sai đầu tiên | 🟠 | "Hành vi nhất quán" để hậu xử lý |
-| 7.1 | Error rate: entity liên tục vs. có key in chen giữa | 🔴 | Vấn đề nhãn có độc lập không |
-| 2.5 | Tỉ lệ zigzag theo từng trường | 🟠 | Có aliasing nội dung lặp không |
-| 2.6a–d | F1 orderless · pair-F1 e2e · tách domain · 3 seed | 🟠 | Ngưỡng ý nghĩa |
-
-### Sprint A — Phá shortcut (train lại, ~1 tuần)
-
-| # | Việc | Ghi chú |
+| # | Việc | Kết quả mong đợi |
 |---|---|---|
-| 4.1 | Augmentation đan xen dòng, áp lên chữ in | 🔴 Cốt lõi |
-| 4.2 | Hoán vị `position_ids` 30–50% sample | 🔴 Thử riêng lẻ trước để tách đóng góp |
-| 5.1 | Geometric bias trong khung cục bộ | 🔴 Bắt buộc đi kèm §4 |
-| 5.2 | Feature lề / line-final / n_kv_pairs | 🟠 Rẻ |
-| 9.1 | λ weighting | 🟠 Rẻ |
-| 8.3 | Oversample chữ tay 30–40% | 🟠 |
+| §0 | Xác nhận lỗi nằm ở T1 (gom dòng), không phải T2/T3 | Định hướng toàn bộ phần còn lại |
+| A.8 | Cài `edge_accuracy` trên tập validation | Có baseline để đo mọi thay đổi |
+| A.2 | Thêm ràng buộc x-overlap vào thuật toán hiện tại | Có thể sửa được phần lớn ngay |
+| B.5 | Ensemble 5 hoán vị lúc inference | Đo mức phụ thuộc thứ tự, có thể cải thiện luôn |
 
-> §4 và §5 phải nằm trong **cùng một vòng train**. Lấy đi shortcut mà không bù tín hiệu thì model chỉ đơn giản kém đi.
+A.2 đáng thử đầu tiên vì chi phí gần bằng 0 và nó nhắm đúng cơ chế trong ví dụ giấy khai sinh.
 
-### Sprint B — Song song, độc lập
+**Tuần 2–3 — thuật toán**
 
 | # | Việc |
 |---|---|
-| 10.1 | Abstention theo margin — **làm ngay tuần này** |
-| 10.2 | Post-process template + cross-check số/chữ |
-| 7.1 | Sửa quy ước nhãn `Ghi bằng chữ` |
-| 5.3 | Bật `has_spatial_attention_bias`, train from scratch |
-| 9.2 | Focal loss |
+| A.3 | Ước lượng thân chữ theo percentile |
+| A.4 | Skew cục bộ kiểu Docstrum |
+| A.5 | Max-regret path cover thay cho clustering + sort |
+| A.6 | Thêm score LM tiếng Việt |
+| A.7 | Neo template cho các mẫu đã biết |
 
-### Sprint C — Cấu trúc head
-
-| # | Việc |
-|---|---|
-| 6.1 | BIO head phụ trợ + ensemble decode — **tỉ lệ lợi ích/công sức cao nhất** |
-| 6.2 | Head đối xứng gom nhóm + STC cục bộ trong nhóm |
-| 6.3 | GOSE (hỗ trợ LayoutXLM sẵn) |
-| 6.5 | Entity-level pooled repr + scheduled sampling |
-
-### Sprint D — Dữ liệu
+**Tuần 4+ — model**
 
 | # | Việc |
 |---|---|
-| 8.1 | Synthetic chữ tay với điểm ngắt dòng biến thiên, chạy qua OCR engine thật |
-| 8.2 | Augraphy 6 augmentation |
-| 8.4 | Line-normalized bbox |
+| B.1 | Augmentation hoán vị ở mức word, mô phỏng lỗi gộp dòng |
+| B.4 | Curriculum cho tỉ lệ hoán vị |
+| B.2 | Consistency loss giữa hai hoán vị |
+| B.6 | Head reading order phụ trợ |
+| B.3 | Adversarial debiasing — chỉ nếu trên chưa đủ |
 
-### Sprint E — Nếu vẫn chưa đủ
+### C.4 Metric báo cáo cho mọi thí nghiệm từ giờ
 
-Reading-order module (§7.3) · PEneo decoder (§6.4) · UNER cho entity gián đoạn · domain-adaptive pre-training LayoutXLM · overlap 128 cho sliding window (đã biết chỉ ~2%)
+1. `edge_accuracy` của tầng reading order (printed / handwritten riêng)
+2. EE-F1 exact và orderless
+3. Pair-F1 end-to-end với entity dự đoán
+4. **Độ phân tán dự đoán giữa K hoán vị** (B.5) — thước đo phụ thuộc thứ tự
+5. F1 trên tập chữ in đã bị hoán vị nhân tạo (v3 §2.1)
 
----
-
-## 12. Nếu chỉ làm được ba việc
-
-1. **Sprint 0′ items 1.4, 2.1, 7.1** — nửa ngày, và quyết định toàn bộ phần còn lại có đúng hướng không. Đặc biệt §1.4: nếu GT đang đơn điệu theo index OCR thì mọi thứ khác trong tài liệu này là vô nghĩa và bạn phải sửa OCR line grouping trước.
-
-2. **§4.1 + §5.1: augmentation đan xen dòng + geometric bias khung cục bộ** — tấn công trực diện shortcut, đồng thời cấp cho model tín hiệu thay thế. Biến 95% dữ liệu chữ in thành tài nguyên cho 5% chữ tay theo cách mà bbox augmentation không làm được.
-
-3. **§10.1 + §10.2: abstention theo margin + post-process template** — vá production ngay tuần này, độc lập với mọi thay đổi model, và tận dụng đúng thứ bạn đã quan sát được (softmax phẳng).
-
-Cả ba giữ nguyên **LayoutXLM backbone** và **không cần annotation mới** (ngoại trừ việc tách nhãn `Ghi bằng chữ`, vốn là chuyển đổi format chứ không phải gán nhãn lại).
+Số 4 và 5 là hai con số mới, và chúng là thứ duy nhất cho bạn biết hướng 2 có thực sự tiến triển hay không.
 
 ---
 
-## 13. Giao thức ablation
+## Phần D — Tài liệu
 
-1. Cố định split, seed set (≥3), số epoch, LR schedule giữa các thí nghiệm
-2. Báo cáo **mean ± std** trên 3 seed, không phải best run
-3. Mỗi lần báo cáo **5 con số**: EE-F1(exact) · EE-F1(orderless) · EL-F1 · **pair-F1 end-to-end** · **F1 trên permutation test (§2.1)**
-4. Tách riêng **printed / handwritten**, và tách riêng **entity liên tục / gián đoạn**
-5. Giữ một **held-out test set** không bao giờ dùng để chọn hyperparameter
-6. Mỗi thay đổi một biến; nếu bundle, làm ablation ngược
+### Reading order — thuật toán
+- **Docstrum** (O'Gorman 1993) — nearest-neighbor clustering, bất biến skew, xử lý được vùng đa hướng. Nền tảng cho §A.4
+- **Recursive XY-Cut** (Ha, Haralick & Phillips 1995) — nền tảng, đạt 100% trên layout Manhattan nhưng cần khoảng trắng phân tách sạch
+- **Optimized XY-Cut** (Meunier, ICDAR 2005) — dynamic programming, dưới 1 giây mỗi trang
+- **XY-Cut++** — [arXiv:2504.10258](https://arxiv.org/abs/2504.10258) · ngưỡng thích ứng theo median box length, hierarchical mask. Có bản cài đặt trong OpenDataLoader PDF
+- **Reading Order Inference for Complex Document Layouts** — [arXiv:2607.01018](https://arxiv.org/abs/2607.01018) · **quan trọng nhất cho §A.5/A.6**: path cover + max-regret + scoring bằng LM, training-free
 
-> Con số thứ 5 là mới và quan trọng nhất: **F1 trên tập chữ in đã bị hoán vị đan xen dòng** là proxy trực tiếp cho "shortcut đã bị phá chưa", và bạn đo được nó trên lượng dữ liệu lớn hơn nhiều so với 5% chữ tay thật.
+### Reading order — model
+- **LayoutReader / ReadingBank** — [GitHub](https://github.com/doc-analysis/ReadingBank) · seq2seq, 500K trang. ⚠️ Giám sát ở mức **word** từ file DOCX; bài 2607.01018 cho thấy nó transfer rất kém sang input mức dòng/đoạn và không bất biến với phép lật trang
+- **RORE** — [arXiv:2409.19672](https://arxiv.org/abs/2409.19672) · ma trận thứ tự n×n, pseudo-label
+- **TPP** — [arXiv:2310.11016](https://arxiv.org/abs/2310.11016) · xác nhận việc sửa thứ tự token đầu vào bằng model reading order là có hiệu quả
+- **DLAFormer** — [arXiv:2405.11757](https://arxiv.org/abs/2405.11757) · unified label space cho nhiều relation prediction task
+- **UniHDSA** — [arXiv:2503.15893](https://arxiv.org/abs/2503.15893)
 
----
+### Line segmentation cho chữ tay
+- Quirós & Vidal — reading order decoding cho tài liệu viết tay, giả định partial order ở mức element
+- Handwritten Chinese text line segmentation by clustering with distance metric learning — nêu rõ vì sao projection analysis và k-NN CC grouping thất bại trên chữ tay
+- Robust line segmentation for handwritten documents (CEDAR/Buffalo) — piece-wise projection + bivariate Gaussian cho dòng chồng nhau
 
-## 14. Danh mục tài liệu
-
-### Nền tảng pipeline hiện tại
-- **BROS** — [arXiv:2108.04539](https://arxiv.org/abs/2108.04539) · [code](https://github.com/clovaai/bros)
-- **SPADE** (Hwang et al., 2021) — [arXiv:2005.00642](https://arxiv.org/abs/2005.00642)
-- **LayoutXLM / XFUND** — [arXiv:2104.08836](https://arxiv.org/abs/2104.08836)
-- **LayoutLMv2** (kiến trúc gốc của config bạn gửi, §3) — [arXiv:2012.14740](https://arxiv.org/abs/2012.14740)
-
-### Head / decoder thay thế
-- **GOSE** (EMNLP 2023 Findings) — [arXiv:2305.13850](https://arxiv.org/abs/2305.13850) · [code](https://github.com/chenxn2020/GOSE) — *hỗ trợ LayoutXLM sẵn*
-- **KVPFormer** (AAAI 2023, nguồn của spatial compatibility bias) — [arXiv:2304.07957](https://arxiv.org/abs/2304.07957)
-- **GeoLayoutLM** (CVPR 2023) — [arXiv:2304.10759](https://arxiv.org/abs/2304.10759) · [code](https://github.com/AlibabaResearch/AdvancedLiterateMachinery/tree/main/DocumentUnderstanding/GeoLayoutLM)
-- **PEneo** (ACM MM 2024) — [arXiv:2401.03472](https://arxiv.org/abs/2401.03472) · [code](https://github.com/ZeningLin/PEneo) · ⚠️ non-commercial
-- **RE2** (NAACL 2024) — [arXiv:2305.14590](https://arxiv.org/abs/2305.14590)
-- **TPP** (EMNLP 2023) — [arXiv:2310.11016](https://arxiv.org/abs/2310.11016)
-- **UNER** (entity gián đoạn) — [arXiv:2408.01038](https://arxiv.org/abs/2408.01038)
-- **TPLinker** (nguồn handshaking của PEneo) — [arXiv:2010.13415](https://arxiv.org/abs/2010.13415)
-- **Biaffine parser** — [arXiv:1611.01734](https://arxiv.org/abs/1611.01734)
-
-### Reading order
-- **RORE** — [arXiv:2409.19672](https://arxiv.org/abs/2409.19672)
-- **ROAP** (preprint 2026, tự verify trước khi đầu tư) — [arXiv:2601.05470](https://arxiv.org/abs/2601.05470)
-
-### Augmentation / dữ liệu
-- **LayTextLLM** (Shuffled-OCR SFT) — [arXiv:2407.01976](https://arxiv.org/abs/2407.01976)
-- **Augraphy** — [arXiv:2208.14558](https://arxiv.org/abs/2208.14558) · [GitHub](https://github.com/sparkfish/augraphy)
-- **Enhancing Document Key Information Localization Through Data Augmentation** (digital→handwritten, Form-NLU) — [arXiv:2502.06132](https://arxiv.org/abs/2502.06132)
-- **Advancing Offline HTR** (survey, 2025) — [arXiv:2507.06275](https://arxiv.org/abs/2507.06275)
-
-### Bối cảnh
-- **Focal Loss** — [arXiv:1708.02002](https://arxiv.org/abs/1708.02002)
-- **SERA** (EMNLP 2021) — [arXiv:2110.09915](https://arxiv.org/abs/2110.09915)
-- **LiLT** — [arXiv:2202.13669](https://arxiv.org/abs/2202.13669)
-- **Document AI Recommendations** — [GitHub](https://github.com/SCUT-DLVCLab/Document-AI-Recommendations)
+### Đã dẫn ở v3
+LayoutLMv2 · BROS · SPADE · LayoutXLM · GOSE · KVPFormer · GeoLayoutLM · PEneo · RE2 · UNER · Augraphy · LayTextLLM
